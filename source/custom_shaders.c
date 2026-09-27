@@ -1264,17 +1264,17 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	GLboolean is_packed = p->attr_num > 1;
 	if (is_packed) {
 #endif
+		/* Inspect every attribute: later streams can be client memory even
+		 * after different VBOs have ruled out packed storage. */
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
 			vbo *attr_vbo = (vbo *)cur_vao->vertex_attrib_vbo[attr_idx];
 			if (attr_vbo) {
 #ifdef STRICT_DRAW_COMPLIANCE
 					vgl_memset(is_packed, 0, p->attr_num * sizeof(GLboolean));
-					break;
 #else
 				if (attr_vbo != target_vbo) {
 					is_packed = GL_FALSE;
-					break;
 				}
 #endif
 			} else {
