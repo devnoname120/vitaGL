@@ -168,6 +168,7 @@ inline float4 vgl_mod(float4 x, float4 y) { return x - y * floor(x / y); }
 #define matrix _matrix
 #define Matrix _Matrix
 #define sampler _sampler
+#define texture vgl_tex
 #define vgl varying
 #define POUT(x, y) \
 	varying out x : CLP##y
