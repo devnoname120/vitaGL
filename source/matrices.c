@@ -784,7 +784,7 @@ void glMatrixPop(GLenum mode) {
 		{
 #ifndef SKIP_ERROR_HANDLING
 			// Error handling
-			if (modelview_stack_counter == 0) {
+			if (modelview_stack_counter <= 1) {
 				SET_GL_ERROR(GL_STACK_UNDERFLOW)
 			}
 #endif
@@ -799,7 +799,7 @@ void glMatrixPop(GLenum mode) {
 		{
 #ifndef SKIP_ERROR_HANDLING
 			// Error handling
-			if (projection_stack_counter == 0) {
+			if (projection_stack_counter <= 1) {
 				SET_GL_ERROR(GL_STACK_UNDERFLOW)
 			}
 #endif
@@ -815,7 +815,7 @@ void glMatrixPop(GLenum mode) {
 
 #ifndef SKIP_ERROR_HANDLING
 			// Error handling
-			if (tex_unit->texture_stack_counter == 0) {
+			if (tex_unit->texture_stack_counter <= 1) {
 				SET_GL_ERROR(GL_STACK_UNDERFLOW)
 			}
 #endif
@@ -998,7 +998,7 @@ void glPopMatrix(void) {
 	if (matrix == &modelview_matrix) {
 #ifndef SKIP_ERROR_HANDLING
 		// Error handling
-		if (modelview_stack_counter == 0) {
+		if (modelview_stack_counter <= 1) {
 			SET_GL_ERROR(GL_STACK_UNDERFLOW)
 		}
 #endif
@@ -1012,7 +1012,7 @@ void glPopMatrix(void) {
 	} else if (matrix == &projection_matrix) {
 #ifndef SKIP_ERROR_HANDLING
 		// Error handling
-		if (projection_stack_counter == 0) {
+		if (projection_stack_counter <= 1) {
 			SET_GL_ERROR(GL_STACK_UNDERFLOW)
 		}
 #endif
@@ -1027,7 +1027,7 @@ void glPopMatrix(void) {
 
 #ifndef SKIP_ERROR_HANDLING
 		// Error handling
-		if (tex_unit->texture_stack_counter == 0) {
+		if (tex_unit->texture_stack_counter <= 1) {
 			SET_GL_ERROR(GL_STACK_UNDERFLOW)
 		}
 #endif
