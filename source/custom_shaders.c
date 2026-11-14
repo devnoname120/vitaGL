@@ -525,6 +525,21 @@ static GLboolean ensure_custom_shader_storage(void) {
 #ifdef HAVE_SHARK_LOG
 static char *shark_log = NULL;
 #endif
+#ifdef HAVE_LINK_TRACE
+
+static void nba2k16_dump_link_source(const char *path, const char *stage, const shader *s) {
+	int result = -1;
+	if (s && s->source && s->size) {
+		SceUID file = sceIoOpen(path, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+		if (file >= 0) {
+			result = sceIoWrite(file, s->source, s->size);
+			sceIoClose(file);
+		}
+	}
+	sceClibPrintf("NBA2K16_VGL_SOURCE_DUMP stage=%s bytes=%u result=%d path=%s\n",
+		stage, s ? (unsigned)s->size : 0u, result, path);
+}
+#endif
 
 #ifdef STRICT_UNIFORMS_COMPLIANCE
 static inline __attribute__((always_inline)) uniform *get_uniform_from_ptr(GLint ptr, uint32_t *offset) {
@@ -1958,6 +1973,10 @@ void _vglDrawObjects_CustomShadersIMPL() {
 
 #ifdef HAVE_SHARK_LOG
 void shark_log_cb(const char *msg, shark_log_level msg_level, int line) {
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("NBA2K16_VGL_SHARK_LOG level=%d line=%d msg=%s\n",
+		(int)msg_level, line, msg ? msg : "(null)");
+#endif
 	char newline[1024];
 	GLboolean is_extra_line = shark_log ? GL_TRUE : GL_FALSE;
 	switch (msg_level) {
@@ -2585,7 +2604,13 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
 }
 
 void glLinkProgram(GLuint progr) {
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK enter program=%u\n", (unsigned)progr);
+#endif
 	THREAD_SAFE()
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK lock_acquired program=%u\n", (unsigned)progr);
+#endif
 
 	// Grabbing passed program
 	program *p = &progs[progr - 1];
@@ -2618,37 +2643,89 @@ void glLinkProgram(GLuint progr) {
 			uint64_t hash = XXH3_64bits(p->vshader->source, p->vshader->size);
 			uint8_t subdir_hash = hash >> 56;
 			fname_len = sprintf(vert_fname, "%s/v/%02X/%016llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+#ifdef HAVE_LINK_TRACE
+			sceClibPrintf("VGL_LINK vertex_cache_open_begin program=%u\n", (unsigned)progr);
+#endif
 			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
+#ifdef HAVE_LINK_TRACE
+			sceClibPrintf("VGL_LINK vertex_cache_open_end program=%u fd=%d\n", (unsigned)progr, (int)f);
+			if (f >= 0) {
+				sceClibPrintf("VGL_LINK vertex_cache_load_begin program=%u\n", (unsigned)progr);
+#else
 			if (f >= 0)
+#endif
 				load_shader_cache(f, p->vshader, GL_TRUE);
+#ifdef HAVE_LINK_TRACE
+				sceClibPrintf("VGL_LINK vertex_cache_load_end program=%u shader=%08X\n",
+					(unsigned)progr, (unsigned)(uintptr_t)p->vshader->prog);
+			}
+#endif
 		}
 		if (!p->fshader->prog) {
 			uint64_t hash = XXH3_64bits(p->fshader->source, p->fshader->size);
 			uint8_t subdir_hash = hash >> 56;
 			fname_len = sprintf(frag_fname, "%s/f/%02X/%016llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+#ifdef HAVE_LINK_TRACE
+			sceClibPrintf("VGL_LINK fragment_cache_open_begin program=%u\n", (unsigned)progr);
+#endif
 			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
+#ifdef HAVE_LINK_TRACE
+			sceClibPrintf("VGL_LINK fragment_cache_open_end program=%u fd=%d\n", (unsigned)progr, (int)f);
+			if (f >= 0) {
+				sceClibPrintf("VGL_LINK fragment_cache_load_begin program=%u\n", (unsigned)progr);
+#else
 			if (f >= 0)
+#endif
 				load_shader_cache(f, p->fshader, GL_TRUE);
+#ifdef HAVE_LINK_TRACE
+				sceClibPrintf("VGL_LINK fragment_cache_load_end program=%u shader=%08X\n",
+					(unsigned)progr, (unsigned)(uintptr_t)p->fshader->prog);
+			}
+#endif
 		}
 #endif
 		if (!p->vshader->prog || !p->fshader->prog) {
 			if (p->vshader->is_glsl || p->fshader->is_glsl) {
+#ifdef HAVE_LINK_TRACE
+				sceClibPrintf("VGL_LINK translate_begin program=%u\n", (unsigned)progr);
+#endif
 				if (!glsl_translator_set_process(p->vshader, p->fshader)) {
 					glsl_sema_mode = VGL_MODE_POSTPONED;
 					return;
 				}
+#ifdef HAVE_LINK_TRACE
+				sceClibPrintf("VGL_LINK translate_end program=%u\n", (unsigned)progr);
+#endif
 			}
 			if (!p->vshader->prog) {
 #ifdef HAVE_SHADER_CACHE
 				fname = vert_fname;
 #endif
+#ifdef HAVE_LINK_TRACE
+				nba2k16_dump_link_source("ux0:data/nba2k16/loader/vitagl-link-vertex.cg.log", "vertex", p->vshader);
+				sceClibPrintf("VGL_LINK vertex_compile_begin program=%u size=%u\n",
+					(unsigned)progr, (unsigned)p->vshader->size);
+#endif
 				vgl_compile_shader(p->vshader, GL_TRUE);
+#ifdef HAVE_LINK_TRACE
+				sceClibPrintf("VGL_LINK vertex_compile_end program=%u shader=%08X size=%u\n",
+					(unsigned)progr, (unsigned)(uintptr_t)p->vshader->prog, (unsigned)p->vshader->size);
+#endif
 			}
 			if (!p->fshader->prog) {
 #ifdef HAVE_SHADER_CACHE
 				fname = frag_fname;
 #endif
+#ifdef HAVE_LINK_TRACE
+					nba2k16_dump_link_source("ux0:data/nba2k16/loader/vitagl-link-fragment.cg.log", "fragment", p->fshader);
+					sceClibPrintf("VGL_LINK fragment_compile_begin program=%u size=%u\n",
+						(unsigned)progr, (unsigned)p->fshader->size);
+#endif
 					vgl_compile_shader(p->fshader, GL_TRUE);
+#ifdef HAVE_LINK_TRACE
+					sceClibPrintf("VGL_LINK fragment_compile_end program=%u shader=%08X size=%u\n",
+						(unsigned)progr, (unsigned)(uintptr_t)p->fshader->prog, (unsigned)p->fshader->size);
+#endif
 				}
 			}
 			if (!p->vshader->prog || !p->fshader->prog) {
@@ -2656,7 +2733,12 @@ void glLinkProgram(GLuint progr) {
 				return;
 			}
 
+#ifdef HAVE_LINK_TRACE
+		sceClibPrintf("VGL_LINK attributes_begin program=%u\n", (unsigned)progr);
+		// Setting progressive default attribute bindings
+#else
 			// Setting progressive default attribute bindings
+#endif
 		set_default_attrib_binding();
 
 		if (p->glsl_attr_map) {
@@ -2666,6 +2748,10 @@ void glLinkProgram(GLuint progr) {
 			vgl_free(p->glsl_attr_map);
 			p->glsl_attr_map = NULL;
 		}
+#ifdef HAVE_LINK_TRACE
+		sceClibPrintf("VGL_LINK attributes_end program=%u count=%u\n",
+			(unsigned)progr, (unsigned)p->attr_highest_idx);
+#endif
 		glsl_sema_mode = VGL_MODE_POSTPONED;
 	}
 
@@ -2674,6 +2760,10 @@ void glLinkProgram(GLuint progr) {
 		return;
 	}
 	p->status = PROG_LINKED;
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK metadata_begin program=%u vertex=%08X fragment=%08X\n",
+		(unsigned)progr, (unsigned)(uintptr_t)p->vshader->prog, (unsigned)(uintptr_t)p->fshader->prog);
+#endif
 	
 	// Set up uniform buffers
 	if (p->vshader->unif_buf_size) {
@@ -2682,6 +2772,10 @@ void glLinkProgram(GLuint progr) {
 	if (p->fshader->unif_buf_size) {
 		p->unif_fbuffer = vglCalloc(1, p->fshader->unif_buf_size);
 	}
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK uniform_buffers_end program=%u vertex=%u fragment=%u\n",
+		(unsigned)progr, (unsigned)p->vshader->unif_buf_size, (unsigned)p->fshader->unif_buf_size);
+#endif
 
 	// Analyzing fragment shader
 	uint32_t i, cnt, j;
@@ -2690,6 +2784,10 @@ void glLinkProgram(GLuint progr) {
 		p->vert_texunits[i] = GL_FALSE;
 	}
 	cnt = sceGxmProgramGetParameterCount(p->fshader->prog);
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK fragment_parameter_count program=%u count=%u\n",
+		(unsigned)progr, (unsigned)cnt);
+#endif
 	uint32_t *_ptr = vglProgramGetParameterBase(p->fshader->prog);
 	uint32_t *ptr = _ptr;
 	for (i = 0; i < cnt; i++) {
@@ -2789,8 +2887,17 @@ void glLinkProgram(GLuint progr) {
 #endif
 	}
 
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK fragment_metadata_end program=%u uniforms=%u\n",
+		(unsigned)progr, (unsigned)p->frag_uniforms_num);
+
+#endif
 	// Analyzing vertex shader
 	cnt = sceGxmProgramGetParameterCount(p->vshader->prog);
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK vertex_parameter_count program=%u count=%u\n",
+		(unsigned)progr, (unsigned)cnt);
+#endif
 	_ptr = vglProgramGetParameterBase(p->vshader->prog);
 	ptr = _ptr;
 	for (i = 0; i < cnt; i++) {
@@ -2851,6 +2958,11 @@ void glLinkProgram(GLuint progr) {
 #endif
 	}
 
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK vertex_metadata_end program=%u uniforms=%u attributes=%u\n",
+		(unsigned)progr, (unsigned)p->vert_uniforms_num, (unsigned)p->attr_num);
+
+#endif
 #ifdef ENABLE_LEGACY_PIPELINE
 	// Creating fragment and vertex program via sceGxmShaderPatcher if using vgl* draw pipeline
 	if (p->attr_mode != VGL_ATTRIB_REGULAR) {
@@ -2889,6 +3001,10 @@ void glLinkProgram(GLuint progr) {
 			}
 		}
 	}
+#ifdef HAVE_LINK_TRACE
+	sceClibPrintf("VGL_LINK metadata_end program=%u\n", (unsigned)progr);
+	sceClibPrintf("VGL_LINK end program=%u status=%d\n", (unsigned)progr, (int)p->status);
+#endif
 }
 
 void glUseProgram(GLuint prog) {
