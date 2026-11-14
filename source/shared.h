@@ -678,6 +678,7 @@ typedef struct {
 	GLboolean scratch;
 #endif
 	GLboolean mapped;
+	GLenum access, usage;
 } vbo;
 
 // VAO struct

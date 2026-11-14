@@ -304,7 +304,10 @@ inline __attribute__((always_inline)) void glGenBuffers(GLsizei n, GLuint *res) 
 		if (!gpu_buf)
 			vgl_log("%s:%d glGenBuffers failed to alloc a buffer (%d/%lu).\n", __FILE__, __LINE__, i, n);
 #endif
-		gpu_buf->ptr = NULL;
+		if (!gpu_buf) { SET_GL_ERROR(GL_OUT_OF_MEMORY) }
+		vgl_memset(gpu_buf, 0, sizeof(*gpu_buf));
+		gpu_buf->access = GL_WRITE_ONLY;
+		gpu_buf->usage = GL_STATIC_DRAW;
 		gpu_buf->last_frame = OBJ_NOT_USED;
 		res[i] = (GLuint)gpu_buf;
 	}
@@ -312,6 +315,25 @@ inline __attribute__((always_inline)) void glGenBuffers(GLsizei n, GLuint *res) 
 
 void glCreateBuffers(GLsizei n, GLuint *buffers) {
 	glGenBuffers(n, buffers);
+}
+
+int vglGetBufferDiagnostic(GLuint buffer,
+		const void **data,
+		GLsizei *size,
+		GLenum *usage,
+		uint32_t *last_frame) {
+	vbo *gpu_buf = (vbo *)buffer;
+	if (!gpu_buf)
+		return 0;
+	if (data)
+		*data = gpu_buf->ptr;
+	if (size)
+		*size = gpu_buf->size;
+	if (usage)
+		*usage = gpu_buf->usage;
+	if (last_frame)
+		*last_frame = gpu_buf->last_frame;
+	return 1;
 }
 
 void glBindBuffer(GLenum target, GLuint buffer) {
@@ -365,6 +387,9 @@ void glDeleteBuffers(GLsizei n, const GLuint *gl_buffers) {
 				// Setting back to NULL just to prevent double free crashes
 				gpu_buf->ptr = NULL;
 			}
+			if (vertex_array_unit == gl_buffers[j]) vertex_array_unit = 0;
+			if (uniform_array_unit == gl_buffers[j]) uniform_array_unit = 0;
+			if (cur_vao->index_array_unit == gl_buffers[j]) cur_vao->index_array_unit = 0;
 			vgl_free(gpu_buf);
 		}
 	}
@@ -380,9 +405,6 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 		SET_GL_ERROR(GL_INVALID_VALUE)
 	} else if (!gpu_buf) {
 		SET_GL_ERROR(GL_INVALID_OPERATION)
-	} else if (size == 0) {
-		vgl_log("%s:%d glNamedBufferData called with size 0. Skipping...\n", __FILE__, __LINE__);
-		return;
 	}
 #endif
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
@@ -426,6 +448,16 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 		}
 	}
 
+	// Replacing a data store also ends any active mapping.
+	gpu_buf->mapped = GL_FALSE;
+	gpu_buf->access = GL_WRITE_ONLY;
+	gpu_buf->usage = usage;
+	if (!size) {
+		gpu_buf->ptr = NULL;
+		gpu_buf->size = 0;
+		gpu_buf->last_frame = OBJ_NOT_USED;
+		return;
+	}
 	// Allocating a new buffer
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 	if (gpu_buf->scratch)
@@ -476,7 +508,9 @@ inline void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size
 #ifndef SKIP_ERROR_HANDLING
 	if (!gpu_buf) {
 		SET_GL_ERROR(GL_INVALID_OPERATION)
-	} else if (offset < 0 || offset + size > gpu_buf->size) {
+	} else if (gpu_buf->mapped) {
+		SET_GL_ERROR(GL_INVALID_OPERATION)
+	} else if (offset < 0 || size < 0 || offset > gpu_buf->size || size > gpu_buf->size - offset) {
 		SET_GL_ERROR(GL_INVALID_VALUE)
 	} else if (size == 0) {
 		vgl_log("%s:%d glNamedBufferSubData called with size 0. Skipping...\n", __FILE__, __LINE__);
@@ -556,12 +590,30 @@ inline void *glMapNamedBuffer(GLuint buffer, GLenum access) {
 		SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, NULL);
 	}
 
-	if (!gpu_buf) {
+	if (!gpu_buf || gpu_buf->mapped || !gpu_buf->size || !gpu_buf->ptr) {
 		SET_GL_ERROR_WITH_RET(GL_INVALID_OPERATION, NULL)
 	}
 #endif
 
-	// FIXME: Current implementation doesn't take into account 'last_frame' state
+	/* A previous draw may still read this store. Preserve unwritten bytes in
+	 * a new store instead of racing the GPU or stalling every streamed map. */
+	if (gpu_buf->last_frame != OBJ_NOT_USED &&
+	    vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ) {
+#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
+		void *ptr = gpu_buf->scratch ? vgl_reserve_data_pool(gpu_buf->size) : gpu_buf->alloc_func(gpu_buf->size);
+#else
+		void *ptr = gpu_buf->alloc_func(gpu_buf->size);
+#endif
+		if (!ptr) { SET_GL_ERROR_WITH_RET(GL_OUT_OF_MEMORY, NULL) }
+		vgl_memcpy(ptr, gpu_buf->ptr, gpu_buf->size);
+#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
+		if (!gpu_buf->scratch)
+#endif
+			mark_as_dirty(gpu_buf->ptr);
+		gpu_buf->ptr = ptr;
+		gpu_buf->last_frame = OBJ_NOT_USED;
+	}
+	gpu_buf->access = access;
 	gpu_buf->mapped = GL_TRUE;
 	return gpu_buf->ptr;
 }
@@ -707,6 +759,15 @@ inline void glGetNamedBufferParameteriv(GLuint buffer, GLenum pname, GLint *para
 	switch (pname) {
 	case GL_BUFFER_SIZE:
 		*params = gpu_buf->size;
+		break;
+	case 0x8765: /* GL_BUFFER_USAGE */
+		*params = gpu_buf->usage;
+		break;
+	case 0x88BB: /* GL_BUFFER_ACCESS_OES */
+		*params = gpu_buf->access;
+		break;
+	case 0x88BC: /* GL_BUFFER_MAPPED_OES */
+		*params = gpu_buf->mapped;
 		break;
 	default:
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, pname)
