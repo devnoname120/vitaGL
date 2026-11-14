@@ -571,6 +571,29 @@ void setup_combiner_pass(int i, char *dst) {
 }
 #endif
 
+static GLboolean append_ffp_shader_source(char *destination, size_t capacity, const char *source) {
+	if (!destination || !capacity || !source)
+		return GL_FALSE;
+	size_t used = 0;
+	while (used < capacity && destination[used])
+		used++;
+	if (used == capacity)
+		return GL_FALSE;
+	size_t remaining = capacity - used;
+	if (used) {
+		if (remaining <= 1)
+			return GL_FALSE;
+		remaining--;
+	}
+	size_t source_size = strlen(source);
+	if (source_size >= remaining)
+		return GL_FALSE;
+	if (used)
+		destination[used++] = '\n';
+	memcpy(destination + used, source, source_size + 1);
+	return GL_TRUE;
+}
+
 uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *streams, SceGxmIndexSource index_type) {
 #ifdef HAVE_PROFILING
 	uint32_t reload_ffp_shaders_start = sceKernelGetProcessTimeLow();
@@ -805,15 +828,6 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 			dirty_frag_unifs = 0xFFFFFFFF;
 		}
 
-		ffp_mask.raw = mask.raw;
-#ifndef DISABLE_TEXTURE_COMBINER
-#ifdef HAVE_HIGH_FFP_TEXUNITS
-		ffp_combiner_mask.raw_high = cmb_mask.raw_high;
-		ffp_combiner_mask.raw_low = cmb_mask.raw_low;
-#else
-		ffp_combiner_mask.raw = cmb_mask.raw;
-#endif
-#endif
 	}
 
 	// Checking if vertex shader requires a recompilation
@@ -842,6 +856,10 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 			sprintf(vshader, ffp_vert_src, mask.clip_planes_num, mask.num_textures, mask.has_colors, mask.lights_num, mask.lighting, mask.shading_mode, mask.normalize, mask.fixed_mask, mask.pos_fixed_mask, WVP_ON_GPU, mask.fast_perspective_correction);
 			uint32_t size = strlen(vshader);
 			SceGxmProgram *t = shark_compile_shader_extended(vshader, &size, SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+			if (!t) {
+				shark_clear_output();
+				return draw_mask_state;
+			}
 			ffp_vertex_program = (SceGxmProgram *)vglMalloc(size);
 			vgl_fast_memcpy((void *)ffp_vertex_program, (void *)t, size);
 			shark_clear_output();
@@ -1076,38 +1094,44 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 				switch (texture_units[base_texture_id + i].env_mode) {
 				case MODULATE:
 					if (unused_mode[MODULATE]) {
-						sprintf(texenv_shad, "%s\n%s", texenv_shad, modulate_src);
+						if (!append_ffp_shader_source(texenv_shad, sizeof(texenv_shad), modulate_src))
+							return draw_mask_state;
 						unused_mode[MODULATE] = GL_FALSE;
 					}
 					break;
 				case DECAL:
 					if (unused_mode[DECAL]) {
-						sprintf(texenv_shad, "%s\n%s", texenv_shad, decal_src);
+						if (!append_ffp_shader_source(texenv_shad, sizeof(texenv_shad), decal_src))
+							return draw_mask_state;
 						unused_mode[DECAL] = GL_FALSE;
 					}
 					break;
 				case BLEND:
 					if (unused_mode[BLEND]) {
-						sprintf(texenv_shad, "%s\n%s", texenv_shad, blend_src);
+						if (!append_ffp_shader_source(texenv_shad, sizeof(texenv_shad), blend_src))
+							return draw_mask_state;
 						unused_mode[BLEND] = GL_FALSE;
 					}
 					break;
 				case ADD:
 					if (unused_mode[ADD]) {
-						sprintf(texenv_shad, "%s\n%s", texenv_shad, add_src);
+						if (!append_ffp_shader_source(texenv_shad, sizeof(texenv_shad), add_src))
+							return draw_mask_state;
 						unused_mode[ADD] = GL_FALSE;
 					}
 					break;
 				case REPLACE:
 					if (unused_mode[REPLACE]) {
-						sprintf(texenv_shad, "%s\n%s", texenv_shad, replace_src);
+						if (!append_ffp_shader_source(texenv_shad, sizeof(texenv_shad), replace_src))
+							return draw_mask_state;
 						unused_mode[REPLACE] = GL_FALSE;
 					}
 					break;
 #ifndef DISABLE_TEXTURE_COMBINER
 				case COMBINE:
 					setup_combiner_pass(i, tmp);
-					sprintf(texenv_shad, "%s\n%s", texenv_shad, tmp);
+					if (!append_ffp_shader_source(texenv_shad, sizeof(texenv_shad), tmp))
+						return draw_mask_state;
 					break;
 #endif
 				default:
@@ -1130,6 +1154,10 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 #endif
 			uint32_t size = strlen(fshader);
 			SceGxmProgram *t = shark_compile_shader_extended(fshader, &size, SHARK_FRAGMENT_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+			if (!t) {
+				shark_clear_output();
+				return draw_mask_state;
+			}
 			ffp_fragment_program = (SceGxmProgram *)vglMalloc(size);
 			vgl_fast_memcpy((void *)ffp_fragment_program, (void *)t, size);
 			shark_clear_output();
@@ -1178,6 +1206,16 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 		// Clearing dirty flags
 		ffp_dirty_frag = GL_FALSE;
 	}
+
+	ffp_mask.raw = mask.raw;
+#ifndef DISABLE_TEXTURE_COMBINER
+#ifdef HAVE_HIGH_FFP_TEXUNITS
+	ffp_combiner_mask.raw_high = cmb_mask.raw_high;
+	ffp_combiner_mask.raw_low = cmb_mask.raw_low;
+#else
+	ffp_combiner_mask.raw = cmb_mask.raw;
+#endif
+#endif
 
 	// Checking if fragment shader requires a blend settings change
 	if (ffp_dirty_frag_blend) {
