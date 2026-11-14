@@ -33,8 +33,26 @@
 
 void *vgl_def_frag_buf = NULL;
 void *vgl_def_vert_buf = NULL;
+#ifdef UNIFORM_POOL_FRAME_RING
+static uint8_t *unif_pool[DISPLAY_MAX_BUFFER_COUNT] = {NULL};
+static uint32_t unif_idx[DISPLAY_MAX_BUFFER_COUNT] = {0};
+static uint32_t unif_frame = UINT32_MAX;
+static uint32_t unif_slot = 0;
+
+static void vglUniformPoolSelectFrame(void) {
+	if (unif_frame == vgl_framecount)
+		return;
+	unif_frame = vgl_framecount;
+	uint32_t pool_count = gxm_display_buffer_count;
+	if (!pool_count || pool_count > DISPLAY_MAX_BUFFER_COUNT)
+		pool_count = DISPLAY_MAX_BUFFER_COUNT;
+	unif_slot = vgl_framecount % pool_count;
+	unif_idx[unif_slot] = 0;
+}
+#else
 static uint8_t *unif_pool = NULL;
 static uint32_t unif_idx = 0;
+#endif
 
 #define VERTEX_PROGRAM_CACHE_WAYS 4
 #define VERTEX_PROGRAM_CACHE_SETS 64
@@ -220,14 +238,29 @@ void vglVertexProgramCacheInvalidate(SceGxmShaderPatcherId id) {
 }
 
 void vglSetupUniformCircularPool() {
+#ifdef UNIFORM_POOL_FRAME_RING
+	for (uint32_t i = 0; i < DISPLAY_MAX_BUFFER_COUNT; i++) {
+		if (!unif_pool[i])
+			unif_pool[i] = gpu_alloc_mapped_for_cpu(UNIFORM_CIRCULAR_POOL_SIZE);
+#else
 	if (!unif_pool) {
 		unif_pool = gpu_alloc_mapped_for_cpu(UNIFORM_CIRCULAR_POOL_SIZE);
+#endif
 	}
 }
 
 void *vglReserveUniformCircularPoolBuffer(uint32_t size) {
+#ifdef UNIFORM_POOL_FRAME_RING
+	vglUniformPoolSelectFrame();
+	uint8_t *pool = unif_pool[unif_slot];
+	uint32_t *idx = &unif_idx[unif_slot];
+#endif
 	void *r;
+#ifdef UNIFORM_POOL_FRAME_RING
+	if (*idx + size >= UNIFORM_CIRCULAR_POOL_SIZE) {
+#else
 	if (unif_idx + size >= UNIFORM_CIRCULAR_POOL_SIZE) {
+#endif
 #ifndef SKIP_ERROR_HANDLING
 		static uint32_t last_frame_swap = 0;
 		if (last_frame_swap == vgl_framecount) {
@@ -235,11 +268,21 @@ void *vglReserveUniformCircularPoolBuffer(uint32_t size) {
 		}
 		last_frame_swap = vgl_framecount;
 #endif
+#ifdef UNIFORM_POOL_FRAME_RING
+		r = pool;
+		*idx = size;
+#else
 		r = unif_pool;
 		unif_idx = size;
+#endif
 	} else {
+#ifdef UNIFORM_POOL_FRAME_RING
+		r = pool + *idx;
+		*idx += size;
+#else
 		r = (unif_pool + unif_idx);
 		unif_idx += size;
+#endif
 	}
 	return r;
 }
