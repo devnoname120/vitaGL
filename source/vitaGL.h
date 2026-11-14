@@ -1347,3 +1347,14 @@ void vglWaitVblankStart(GLboolean enable);
 #endif
 
 #endif
+
+/* iOS ES2 shader lifecycle and validation subset. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+GLboolean glIsShader(GLuint shader);
+void glDetachShader(GLuint program, GLuint shader);
+void glValidateProgram(GLuint program);
+#ifdef __cplusplus
+}
+#endif

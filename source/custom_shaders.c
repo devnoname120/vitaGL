@@ -41,8 +41,16 @@ char vgl_file_cache_path[256];
 #endif
 #endif
 
+#ifndef MAX_CUSTOM_SHADERS
 #define MAX_CUSTOM_SHADERS 2048 // Maximum number of linkable custom shaders
+#endif
+#ifndef MAX_CUSTOM_PROGRAMS
 #define MAX_CUSTOM_PROGRAMS 1024 // Maximum number of linkable custom programs
+#endif
+#if defined(STRICT_UNIFORMS_COMPLIANCE) && MAX_CUSTOM_PROGRAMS > 1024
+#error STRICT_UNIFORMS_COMPLIANCE encodes program handles in 10 bits
+#endif
+#define ML_SHADER_HANDLE_BASE MAX_CUSTOM_PROGRAMS
 
 #define set_default_attrib_binding() \
 	uint32_t cnt = sceGxmProgramGetParameterCount(p->vshader->prog); \
@@ -122,9 +130,11 @@ char vgl_file_cache_path[256];
 		} \
 	}
 
+/* GXM attribute offsets are 16-bit. Packed VBO streams start at the first
+ * attribute; retain only the validated relative displacement here. */
 #define handle_packed_vbo_attrib() \
 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
-		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx]; \
+		attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - cur_vao->vertex_attrib_offsets[p->attr_map[0]]; \
 	} else { \
 		disable_draw_attrib(i) \
 	}	
@@ -346,6 +356,7 @@ typedef struct {
 	shader *vshader;
 	shader *fshader;
 	uint8_t status;
+	GLboolean vertex_detached, fragment_detached;
 	uint8_t max_frag_texunit_idx;
 	uint8_t max_vert_texunit_idx;
 	uniform *vert_texunits[TEXTURE_IMAGE_UNITS_NUM];
@@ -459,7 +470,7 @@ static inline __attribute__((always_inline)) void vertex_layout_setup_ptrs(progr
 	if (is_packed) {
 		uint32_t stride = cur_vao->vertex_stream_config[first_attr_idx].stride;
 		if (target_vbo) {
-			ptrs[0] = (uint8_t *)target_vbo->ptr + first * stride;
+			ptrs[0] = (uint8_t *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[first_attr_idx] + first * stride;
 			target_vbo->last_frame = vgl_framecount;
 		} else {
 			uint32_t size = packed_count * stride;
@@ -502,7 +513,14 @@ static inline __attribute__((always_inline)) void vertex_layout_setup_ptrs(progr
 
 // Internal shaders and array
 static shader *shaders[MAX_CUSTOM_SHADERS];
-static program progs[MAX_CUSTOM_PROGRAMS];
+static program *progs;
+
+static GLboolean ensure_custom_shader_storage(void) {
+	if (progs)
+		return GL_TRUE;
+	progs = vglCalloc(MAX_CUSTOM_PROGRAMS, sizeof(*progs));
+	return progs ? GL_TRUE : GL_FALSE;
+}
 
 #ifdef HAVE_SHARK_LOG
 static char *shark_log = NULL;
@@ -736,7 +754,60 @@ void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings)
 			s->mat = m;
 		}
 	}
+	vgl_free(s->source);
+	s->source = NULL;
 }
+
+#ifdef HAVE_SHADER_CACHE
+static GLboolean load_shader_cache(SceUID file, shader *s, GLboolean load_bindings) {
+	GLboolean loaded = GL_FALSE;
+	void *buffer = NULL;
+	SceOff file_size = sceIoLseek(file, 0, SCE_SEEK_END);
+	if (file_size < (SceOff)sizeof(uint32_t) || file_size > INT32_MAX)
+		goto done;
+	if (sceIoLseek(file, 0, SCE_SEEK_SET) != 0)
+		goto done;
+	size_t size = (size_t)file_size;
+	buffer = vglMalloc(size);
+	if (!buffer || sceIoRead(file, buffer, size) != (int)size)
+		goto done;
+	uint32_t matrix_count;
+	vgl_fast_memcpy(&matrix_count, buffer, sizeof(matrix_count));
+	size_t offset = sizeof(matrix_count);
+	if (matrix_count > (size - offset) / sizeof(uint32_t))
+		goto done;
+	offset += (size_t)matrix_count * sizeof(uint32_t);
+	if (load_bindings) {
+		if (sizeof(binds_map) > size - offset)
+			goto done;
+		offset += sizeof(binds_map);
+	}
+#ifdef HAVE_GLSL_TEXTURE_SIZE
+	if (offset == size)
+		goto done;
+	uint8_t sampler_count = ((uint8_t *)buffer)[offset++];
+	if (sampler_count > sizeof(s->sized_samplers) / sizeof(s->sized_samplers[0]) ||
+			sampler_count > (size - offset) / sizeof(glsl_samplers_info))
+		goto done;
+	offset += (size_t)sampler_count * sizeof(glsl_samplers_info);
+#endif
+	if (offset == size)
+		goto done;
+	for (uint32_t i = 0; i < matrix_count; ++i) {
+		uint32_t index;
+		vgl_fast_memcpy(&index, (uint8_t *)buffer + sizeof(uint32_t) * (i + 1), sizeof(index));
+		if (index >= (size - offset) / (4 * sizeof(uint32_t)))
+			goto done;
+	}
+	unserialize_shader(buffer, size, s, load_bindings);
+	loaded = GL_TRUE;
+done:
+	sceIoClose(file);
+	if (buffer)
+		vgl_free(buffer);
+	return loaded;
+}
+#endif
 
 #ifdef HAVE_SHADER_CACHE
 #define vgl_compile_shader(shd, sv) compile_shader(shd, sv, fname, fname_len)
@@ -801,6 +872,9 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
 }
 
 void reset_custom_shaders(void) {
+	if (!ensure_custom_shader_storage())
+		return;
+
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 	sceClibMemset(&vertex_layout_cache, 0, sizeof(vertex_layout_cache));
 	vertex_layout_cache_id = 0;
@@ -967,7 +1041,9 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 				vgl_memset(is_packed, 0, p->attr_num * sizeof(GLboolean));
 				break;
 #else
-				if (attr_vbo != target_vbo) {
+				if (attr_vbo != target_vbo ||
+                    cur_vao->vertex_attrib_offsets[attr_idx] < cur_vao->vertex_attrib_offsets[p->attr_map[0]] ||
+                    cur_vao->vertex_attrib_offsets[attr_idx] - cur_vao->vertex_attrib_offsets[p->attr_map[0]] > UINT16_MAX) {
 					is_packed = GL_FALSE;
 					break;
 				}
@@ -1004,7 +1080,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 	// Gathering real attribute data pointers
 	if (is_packed) {
 		if (target_vbo) {
-			ptrs[0] = (void *)target_vbo->ptr + lowest * streams[0].stride;
+			ptrs[0] = (uint8_t *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride;
 			target_vbo->last_frame = vgl_framecount;
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1224,7 +1300,9 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				vgl_memset(is_packed, 0, p->attr_num * sizeof(GLboolean));
 				break;
 #else
-				if (attr_vbo != target_vbo) {
+				if (attr_vbo != target_vbo ||
+                    cur_vao->vertex_attrib_offsets[attr_idx] < cur_vao->vertex_attrib_offsets[p->attr_map[0]] ||
+                    cur_vao->vertex_attrib_offsets[attr_idx] - cur_vao->vertex_attrib_offsets[p->attr_map[0]] > UINT16_MAX) {
 					is_packed = GL_FALSE;
 					break;
 				}
@@ -1268,7 +1346,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	// Gathering real attribute data pointers
 	if (is_packed) {
 		if (target_vbo) {
-			ptrs[0] = (void *)target_vbo->ptr + first * streams[0].stride;
+			ptrs[0] = (uint8_t *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride;
 			target_vbo->last_frame = vgl_framecount;
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1532,7 +1610,9 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 #ifdef STRICT_DRAW_COMPLIANCE
 					vgl_memset(is_packed, 0, p->attr_num * sizeof(GLboolean));
 #else
-				if (attr_vbo != target_vbo) {
+				if (attr_vbo != target_vbo ||
+                    cur_vao->vertex_attrib_offsets[attr_idx] < cur_vao->vertex_attrib_offsets[p->attr_map[0]] ||
+                    cur_vao->vertex_attrib_offsets[attr_idx] - cur_vao->vertex_attrib_offsets[p->attr_map[0]] > UINT16_MAX) {
 					is_packed = GL_FALSE;
 				}
 #endif
@@ -1600,7 +1680,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	// Gathering real attribute data pointers
 	if (is_packed) {
 		if (target_vbo) {
-			ptrs[0] = (void *)target_vbo->ptr;
+			ptrs[0] = (uint8_t *)target_vbo->ptr + cur_vao->vertex_attrib_offsets[p->attr_map[0]];
 			target_vbo->last_frame = vgl_framecount;
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1833,6 +1913,8 @@ void vglSetupRuntimeShaderCompiler(shark_opt opt_level, int32_t use_fastmath, in
 }
 
 GLuint glCreateShader(GLenum shaderType) {
+	if (!ensure_custom_shader_storage())
+		return 0;
 #ifndef SKIP_ERROR_HANDLING
 	if (shaderType != GL_FRAGMENT_SHADER && shaderType != GL_VERTEX_SHADER && shaderType != GL_CG_FRAGMENT_SHADER_EXT && shaderType != GL_CG_VERTEX_SHADER_EXT) {
 		SET_GL_ERROR_WITH_RET_AND_VALUE(GL_INVALID_ENUM, 0, shaderType)
@@ -1848,13 +1930,13 @@ GLuint glCreateShader(GLenum shaderType) {
 		}
 	}
 
-#ifndef SKIP_ERROR_HANDLING
 	// All shader slots are busy, exiting call
 	if (res == MAX_CUSTOM_SHADERS) {
+#ifndef SKIP_ERROR_HANDLING
 		vgl_log("%s:%d %s: Out of shaders handles. Consider increasing MAX_CUSTOM_SHADERS...\n", __FILE__, __LINE__, __func__);
+#endif
 		return 0;
 	}
-#endif
 
 	shaders[res] = vglCalloc(1, sizeof(shader));
 	shader *s = shaders[res];
@@ -1874,14 +1956,14 @@ GLuint glCreateShader(GLenum shaderType) {
 		break;
 	}
 
-	return res + 1;
+	return res + 1 + ML_SHADER_HANDLE_BASE;
 }
 
 void glGetShaderiv(GLuint handle, GLenum pname, GLint *params) {
 	THREAD_SAFE()
 
 	// Grabbing passed shader
-	shader *s = shaders[handle - 1];
+	shader *s = shaders[handle - ML_SHADER_HANDLE_BASE - 1];
 	switch (pname) {
 	case GL_SHADER_TYPE:
 		*params = s->type;
@@ -1922,7 +2004,7 @@ void glGetShaderInfoLog(GLuint handle, GLsizei maxLength, GLsizei *length, GLcha
 
 	GLsizei len = 0;
 #ifdef HAVE_SHARK_LOG
-	shader *s = shaders[handle - 1];
+	shader *s = shaders[handle - ML_SHADER_HANDLE_BASE - 1];
 	if (s->log) {
 		len = min(strlen(s->log), maxLength - 1);
 		vgl_fast_memcpy(infoLog, s->log, len);
@@ -1943,7 +2025,7 @@ void glGetShaderSource(GLuint handle, GLsizei bufSize, GLsizei *length, GLchar *
 #endif
 
 	// Grabbing passed shader
-	shader *s = shaders[handle - 1];
+	shader *s = shaders[handle - ML_SHADER_HANDLE_BASE - 1];
 
 	GLsizei size = 0;
 	if (s->source) {
@@ -1960,13 +2042,16 @@ void glGetShaderSource(GLuint handle, GLsizei bufSize, GLsizei *length, GLchar *
 void glShaderSource(GLuint handle, GLsizei count, const GLchar *const *string, const GLint *length) {
 	THREAD_SAFE()
 
+	if (!glIsShader(handle)) {
+		SET_GL_ERROR(GL_INVALID_VALUE)
+	}
 #ifndef SKIP_ERROR_HANDLING
 	if (count < 0 || count > 512) {
 		SET_GL_ERROR(GL_INVALID_VALUE)
 	}
 #endif
 	// Grabbing passed shader
-	shader *s = shaders[handle - 1];
+	shader *s = shaders[handle - ML_SHADER_HANDLE_BASE - 1];
 	
 	uint32_t size = 1;
 	size_t lengths[512];
@@ -1996,7 +2081,7 @@ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, c
 	THREAD_SAFE()
 
 	// Grabbing passed shader
-	shader *s = shaders[handles[0] - 1];
+	shader *s = shaders[handles[0] - ML_SHADER_HANDLE_BASE - 1];
 
 	unserialize_shader((void *)binary, length, s, GL_FALSE);
 }
@@ -2004,13 +2089,16 @@ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, c
 void glCompileShader(GLuint handle) {
 	THREAD_SAFE()
 
+	if (!glIsShader(handle)) {
+		SET_GL_ERROR(GL_INVALID_VALUE)
+	}
 	// If vitaShaRK is not enabled, we try to initialize it
 	if (!is_shark_online && !start_shader_compiler()) {
 		SET_GL_ERROR(GL_INVALID_OPERATION)
 	}
 	
 	// Grabbing passed shader
-	shader *s = shaders[handle - 1];
+	shader *s = shaders[handle - ML_SHADER_HANDLE_BASE - 1];
 	
 	// If we use VGL_MODE_POSTPONED, we compile shaders in glLinkProgram
 	if (s->is_glsl && glsl_sema_mode == VGL_MODE_POSTPONED)
@@ -2022,116 +2110,106 @@ void glCompileShader(GLuint handle) {
 	uint8_t subdir_hash = hash >> 56;
 	int fname_len = sprintf(fname, "%s/%s/%02X/%016llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", subdir_hash, hash);
 	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
-	if (f >= 0) {
-		vgl_free(s->source);
-		s->source = NULL;
-		size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
-		sceIoLseek(f, 0, SCE_SEEK_SET);
-		void *buf = vglMalloc(sz);
-		sceIoRead(f, buf, sz);
-		sceIoClose(f);
-		unserialize_shader(buf, sz, s, GL_FALSE);
-		vgl_free(buf);
+	if (f >= 0 && load_shader_cache(f, s, GL_FALSE))
 		return;
-	}
 #endif
 
 	if (s->is_glsl) {
-		glsl_translator_process(s);
+		if (!glsl_translator_process(s)) return;
 	}
 	vgl_compile_shader(s, GL_FALSE);
 }
 
-void glDeleteShader(GLuint shad) {
-	THREAD_SAFE()
 
-	// Grabbing passed shader
-	shader *s = shaders[shad - 1];
-
-	// If the shader is attached to any program, we only mark it for deletion
-	if (s->ref_counter > 0) {
-		s->dirty = GL_TRUE;
-	} else {
-		release_shader(s);
-	}
+/* BioShock's lifecycle: attach one shader per stage, link once, optionally
+ * detach/delete both shader names, then keep drawing the linked program.
+ * vitaGL's executable still references shader metadata, so detached linked
+ * references stay alive until program deletion. They are hidden from queries. */
+GLboolean glIsShader(GLuint name) {
+    if (name <= ML_SHADER_HANDLE_BASE || name > ML_SHADER_HANDLE_BASE + MAX_CUSTOM_SHADERS)
+        return GL_FALSE;
+    shader *s = shaders[name - ML_SHADER_HANDLE_BASE - 1];
+    if (!s) return GL_FALSE;
+    if (!s->dirty) return GL_TRUE;
+    for (int i = 0; i < MAX_CUSTOM_PROGRAMS; ++i) {
+        program *p = &progs[i];
+        if (p->status && ((!p->vertex_detached && p->vshader == s) ||
+                          (!p->fragment_detached && p->fshader == s))) return GL_TRUE;
+    }
+    return GL_FALSE;
 }
 
-void glAttachShader(GLuint prog, GLuint shad) {
-	THREAD_SAFE()
-
-	// Grabbing passed shader and program
-	shader *s = shaders[shad - 1];
-	program *p = &progs[prog - 1];
-	
-	// Attaching shader to desired program
-	if (p->status == PROG_UNLINKED) {
-		switch (s->type) {
-		case GL_VERTEX_SHADER:
-			s->ref_counter++;
-			if (p->vshader) {
-				p->vshader->ref_counter--;
-				if (p->vshader->dirty && p->vshader->ref_counter == 0) {
-					release_shader(p->vshader);
-				}
-			}
-			p->vshader = s;
-			// If we use VGL_MODE_POSTPONED, we perform attributes binding in glLinkProgram
-			if (glsl_sema_mode != VGL_MODE_POSTPONED || !s->is_glsl) {
-				// Setting progressive default attribute bindings
-				set_default_attrib_binding();	
-			}
-			break;
-		case GL_FRAGMENT_SHADER:
-			s->ref_counter++;
-			if (p->fshader) {
-				p->fshader->ref_counter--;
-				if (p->fshader->dirty && p->fshader->ref_counter == 0) {
-					release_shader(p->fshader);
-				}
-			}
-			p->fshader = s;
-			break;
-		default:
-			break;
-		}
-	} else {
-		SET_GL_ERROR(GL_INVALID_VALUE)
-	}
+void glDeleteShader(GLuint name) {
+    THREAD_SAFE()
+    if (!name) return;
+    if (!glIsShader(name)) { SET_GL_ERROR(GL_INVALID_VALUE) }
+    shader *s = shaders[name - ML_SHADER_HANDLE_BASE - 1];
+    if (s->ref_counter > 0) s->dirty = GL_TRUE;
+    else release_shader(s);
 }
 
-void glGetAttachedShaders(GLuint prog, GLsizei maxCount, GLsizei *count, GLuint *shads) {
-	THREAD_SAFE()
+void glDetachShader(GLuint prog, GLuint name) {
+    THREAD_SAFE()
+    if (!prog || prog > MAX_CUSTOM_PROGRAMS || !progs[prog - 1].status || !glIsShader(name)) {
+        SET_GL_ERROR(GL_INVALID_VALUE)
+    }
+    program *p = &progs[prog - 1];
+    shader *s = shaders[name - ML_SHADER_HANDLE_BASE - 1];
+    shader **slot;
+    GLboolean *detached;
+    if (s == p->vshader && !p->vertex_detached) {slot=&p->vshader;detached=&p->vertex_detached;}
+    else if (s == p->fshader && !p->fragment_detached) {slot=&p->fshader;detached=&p->fragment_detached;}
+    else {SET_GL_ERROR(GL_INVALID_OPERATION)}
+    *detached = GL_TRUE;
+    if (p->status != PROG_LINKED) {
+        *slot = NULL;
+        if (--s->ref_counter == 0 && s->dirty) release_shader(s);
+    }
+}
 
-	// Grabbing passed program
-	program *p = &progs[prog - 1];
+void glAttachShader(GLuint prog, GLuint name) {
+    THREAD_SAFE()
+    if (!prog || prog > MAX_CUSTOM_PROGRAMS || !progs[prog - 1].status || !glIsShader(name)) {
+        SET_GL_ERROR(GL_INVALID_VALUE)
+    }
+    program *p = &progs[prog - 1];
+    shader *s = shaders[name - ML_SHADER_HANDLE_BASE - 1];
+    /* The game creates new program instances; it never edits/relinks one. */
+    if (p->status != PROG_UNLINKED) {SET_GL_ERROR(GL_INVALID_OPERATION)}
+    shader **slot = s->type == GL_VERTEX_SHADER ? &p->vshader : &p->fshader;
+    if (*slot) {SET_GL_ERROR(GL_INVALID_OPERATION)}
+    *slot = s;
+    ++s->ref_counter;
+    if (s->type == GL_VERTEX_SHADER) {
+        p->vertex_detached = GL_FALSE;
+        if (s->prog && (glsl_sema_mode != VGL_MODE_POSTPONED || !s->is_glsl)) { set_default_attrib_binding(); }
+    } else p->fragment_detached = GL_FALSE;
+}
 
-#ifndef SKIP_ERROR_HANDLING
-	if (maxCount < 0) {
-		SET_GL_ERROR_WITH_VALUE(GL_INVALID_VALUE, maxCount)
-	} else if (maxCount == 0) {
-		return;
-	}
-#endif
+void glValidateProgram(GLuint name) {
+    /* Optional shader-cache warmup validation is explicitly out of scope.
+     * Keep the original VitaGL VALIDATE_STATUS query based on link status. */
+    (void)name;
+}
 
-	// Returning attached shaders
-	GLuint shad = 1;
-	*count = 0;
-	if (p->vshader) {
-		shads[0] = p->vshader->slot + 1;
-		*count = 1;
-	}
-#ifndef SKIP_ERROR_HANDLING
-	if (*count >= maxCount) {
-		return;
-	}
-#endif
-	if (p->fshader) {
-		shads[*count] = p->fshader->slot + 1;
-		*count = *count + 1;
-	}
+
+void glGetAttachedShaders(GLuint name, GLsizei maxCount, GLsizei *count, GLuint *out) {
+    THREAD_SAFE()
+    if (!name || name > MAX_CUSTOM_PROGRAMS || !progs[name - 1].status) {SET_GL_ERROR(GL_INVALID_VALUE)}
+    if (maxCount < 0) {SET_GL_ERROR(GL_INVALID_VALUE)}
+    program *p = &progs[name - 1];
+    GLsizei n = 0;
+    if (p->vshader && !p->vertex_detached && n < maxCount)
+        out[n++] = p->vshader->slot + 1 + ML_SHADER_HANDLE_BASE;
+    if (p->fshader && !p->fragment_detached && n < maxCount)
+        out[n++] = p->fshader->slot + 1 + ML_SHADER_HANDLE_BASE;
+    if (count) *count = n;
 }
 
 GLuint glCreateProgram(void) {
+	if (!ensure_custom_shader_storage())
+		return 0;
+
 	// Looking for a free program slot
 	GLuint i, j, res = 0xFFFFFFFF;
 	for (i = 1; i <= MAX_CUSTOM_PROGRAMS; i++) {
@@ -2142,6 +2220,7 @@ GLuint glCreateProgram(void) {
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 			progs[i].vertex_layout_version = ++vertex_program_layout_current_ver;
 #endif
+			progs[i].vertex_detached = progs[i].fragment_detached = GL_FALSE;
 			progs[i].attr_num = 0;
 #ifdef ENABLE_LEGACY_PIPELINE
 			progs[i].attr_mode = VGL_ATTRIB_REGULAR;
@@ -2177,17 +2256,17 @@ GLuint glCreateProgram(void) {
 			break;
 		}
 	}
-#ifndef SKIP_ERROR_HANDLING
 	if (res == 0xFFFFFFFF) {
+#ifndef SKIP_ERROR_HANDLING
 		vgl_log("%s:%d %s: Out of programs handles. Consider increasing MAX_CUSTOM_PROGRAMS...\n", __FILE__, __LINE__, __func__);
+#endif
 		return 0;
 	}
-#endif
 	return res;
 }
 
 GLboolean glIsProgram(GLuint i) {
-	if (progs[i - 1].status != PROG_INVALID)
+	if (progs && i && i <= MAX_CUSTOM_PROGRAMS && progs[i - 1].status != PROG_INVALID)
 		return GL_TRUE;
 	return GL_FALSE;
 }
@@ -2331,12 +2410,7 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
 		*params = serialized_shader_size(p->vshader, GL_FALSE, &dummy) + serialized_shader_size(p->fshader, GL_FALSE, &dummy) + sizeof(GLuint) * 3 + sizeof(SceGxmVertexAttribute) * VERTEX_ATTRIBS_NUM;
 		break;
 	case GL_ATTACHED_SHADERS:
-		i = 0;
-		if (p->fshader)
-			i++;
-		if (p->vshader)
-			i++;
-		*params = i;
+		*params = (p->vshader && !p->vertex_detached) + (p->fshader && !p->fragment_detached);
 		break;
 	case GL_ACTIVE_ATTRIBUTES:
 		*params = p->attr_num;
@@ -2386,6 +2460,7 @@ void glLinkProgram(GLuint progr) {
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 	p->vertex_layout_version = ++vertex_program_layout_current_ver;
 #endif
+    if (!p->vshader || !p->fshader || p->vertex_detached || p->fragment_detached) return;
 #ifndef SKIP_ERROR_HANDLING
 	if (glsl_sema_mode == VGL_MODE_POSTPONED) {
 		if (!(p->fshader->prog || (p->fshader->is_glsl && p->fshader->source)) || !(p->vshader->prog || (p->vshader->is_glsl && p->vshader->source))) {
@@ -2412,35 +2487,24 @@ void glLinkProgram(GLuint progr) {
 			uint8_t subdir_hash = hash >> 56;
 			fname_len = sprintf(vert_fname, "%s/v/%02X/%016llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
 			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
-			if (f >= 0) {
-				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
-				sceIoLseek(f, 0, SCE_SEEK_SET);
-				void *buf = vglMalloc(sz);
-				sceIoRead(f, buf, sz);
-				sceIoClose(f);
-				unserialize_shader(buf, sz, p->vshader, GL_TRUE);
-				vgl_free(buf);
-			}
+			if (f >= 0)
+				load_shader_cache(f, p->vshader, GL_TRUE);
 		}
 		if (!p->fshader->prog) {
 			uint64_t hash = XXH3_64bits(p->fshader->source, p->fshader->size);
 			uint8_t subdir_hash = hash >> 56;
 			fname_len = sprintf(frag_fname, "%s/f/%02X/%016llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
 			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
-			if (f >= 0) {
-				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
-				sceIoLseek(f, 0, SCE_SEEK_SET);
-				void *buf = vglMalloc(sz);
-				sceIoRead(f, buf, sz);
-				sceIoClose(f);
-				unserialize_shader(buf, sz, p->fshader, GL_TRUE);
-				vgl_free(buf);
-			}
+			if (f >= 0)
+				load_shader_cache(f, p->fshader, GL_TRUE);
 		}
 #endif
 		if (!p->vshader->prog || !p->fshader->prog) {
 			if (p->vshader->is_glsl || p->fshader->is_glsl) {
-				glsl_translator_set_process(p->vshader, p->fshader);
+				if (!glsl_translator_set_process(p->vshader, p->fshader)) {
+					glsl_sema_mode = VGL_MODE_POSTPONED;
+					return;
+				}
 			}
 			if (!p->vshader->prog) {
 #ifdef HAVE_SHADER_CACHE
@@ -2452,11 +2516,15 @@ void glLinkProgram(GLuint progr) {
 #ifdef HAVE_SHADER_CACHE
 				fname = frag_fname;
 #endif
-				vgl_compile_shader(p->fshader, GL_TRUE);
+					vgl_compile_shader(p->fshader, GL_TRUE);
+				}
 			}
-		}
+			if (!p->vshader->prog || !p->fshader->prog) {
+				glsl_sema_mode = VGL_MODE_POSTPONED;
+				return;
+			}
 
-		// Setting progressive default attribute bindings
+			// Setting progressive default attribute bindings
 		set_default_attrib_binding();
 
 		if (p->glsl_attr_map) {
@@ -2693,6 +2761,16 @@ void glLinkProgram(GLuint progr) {
 
 void glUseProgram(GLuint prog) {
 	THREAD_SAFE()
+	if (prog) {
+		if (prog > MAX_CUSTOM_PROGRAMS || progs[prog - 1].status == PROG_INVALID) {
+			SET_GL_ERROR_WITH_VALUE(glIsShader(prog) ? GL_INVALID_OPERATION : GL_INVALID_VALUE, prog)
+		}
+		program *p = &progs[prog - 1];
+		if (p->status != PROG_LINKED || !p->vshader || !p->fshader ||
+		    !p->vshader->prog || !p->fshader->prog) {
+			SET_GL_ERROR_WITH_VALUE(GL_INVALID_OPERATION, prog)
+		}
+	}
 
 	if (cur_program == prog) {
 		return;
@@ -2737,8 +2815,18 @@ void glUniformBlockBinding(GLuint prog, GLuint uniformBlockIndex, GLuint uniform
 }
 
 GLint glGetUniformLocation(GLuint prog, const GLchar *name) {
+	if (!prog || prog > MAX_CUSTOM_PROGRAMS || progs[prog - 1].status == PROG_INVALID) {
+		SET_GL_ERROR_WITH_RET_AND_VALUE(glIsShader(prog) ? GL_INVALID_OPERATION : GL_INVALID_VALUE, -1, prog)
+	}
+
 	// Grabbing passed program
 	program *p = &progs[prog - 1];
+	/* Failed compilation/linking leaves no executable for SDK reflection. */
+	if (p->status != PROG_LINKED || !p->vshader || !p->fshader ||
+	    !p->vshader->prog || !p->fshader->prog) {
+		SET_GL_ERROR_WITH_RET_AND_VALUE(GL_INVALID_OPERATION, -1, prog)
+	}
+
 
 	// texture, sampler and matrix are reserved keywords in CG but are not in GLSL
 	if (!strcmp(name, "texture"))
@@ -3664,7 +3752,17 @@ void glBindAttribLocation(GLuint prog, GLuint index, const GLchar *name) {
 }
 
 GLint glGetAttribLocation(GLuint prog, const GLchar *name) {
+	if (!prog || prog > MAX_CUSTOM_PROGRAMS || progs[prog - 1].status == PROG_INVALID) {
+		SET_GL_ERROR_WITH_RET_AND_VALUE(glIsShader(prog) ? GL_INVALID_OPERATION : GL_INVALID_VALUE, -1, prog)
+	}
+
 	program *p = &progs[prog - 1];
+	/* Failed compilation/linking leaves no executable for SDK reflection. */
+	if (p->status != PROG_LINKED || !p->vshader || !p->fshader ||
+	    !p->vshader->prog || !p->fshader->prog) {
+		SET_GL_ERROR_WITH_RET_AND_VALUE(GL_INVALID_OPERATION, -1, prog)
+	}
+
 	const SceGxmProgramParameter *param = sceGxmProgramFindParameterByName(p->vshader->prog, name);
 	if (param == NULL || sceGxmProgramParameterGetCategory(param) != SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE)
 		return -1;
@@ -3952,7 +4050,7 @@ void vglGetShaderBinary(GLuint handle, GLsizei bufSize, GLsizei *length, void *b
 #endif
 
 	// Grabbing passed shader
-	shader *s = shaders[handle - 1];
+	shader *s = shaders[handle - ML_SHADER_HANDLE_BASE - 1];
 
 #ifndef SKIP_ERROR_HANDLING
 	if (s->prog == NULL) {
@@ -4021,7 +4119,7 @@ void vglShaderGxpBinary(GLsizei count, const GLuint *handles, const void *binary
 	THREAD_SAFE()
 
 	// Grabbing passed shader
-	shader *s = shaders[handles[0] - 1];
+	shader *s = shaders[handles[0] - ML_SHADER_HANDLE_BASE - 1];
 	
 	s->size = length;
 	s->prog = (SceGxmProgram *)vglMalloc(s->size);
