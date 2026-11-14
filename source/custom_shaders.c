@@ -527,7 +527,7 @@ static char *shark_log = NULL;
 #endif
 #ifdef HAVE_LINK_TRACE
 
-static void nba2k16_dump_link_source(const char *path, const char *stage, const shader *s) {
+static void vgl_link_trace_dump_source(const char *path, const char *stage, const shader *s) {
 	int result = -1;
 	if (s && s->source && s->size) {
 		SceUID file = sceIoOpen(path, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
@@ -536,7 +536,7 @@ static void nba2k16_dump_link_source(const char *path, const char *stage, const 
 			sceIoClose(file);
 		}
 	}
-	sceClibPrintf("NBA2K16_VGL_SOURCE_DUMP stage=%s bytes=%u result=%d path=%s\n",
+	sceClibPrintf("VGL_LINK_SOURCE_DUMP stage=%s bytes=%u result=%d path=%s\n",
 		stage, s ? (unsigned)s->size : 0u, result, path);
 }
 #endif
@@ -1974,7 +1974,7 @@ void _vglDrawObjects_CustomShadersIMPL() {
 #ifdef HAVE_SHARK_LOG
 void shark_log_cb(const char *msg, shark_log_level msg_level, int line) {
 #ifdef HAVE_LINK_TRACE
-	sceClibPrintf("NBA2K16_VGL_SHARK_LOG level=%d line=%d msg=%s\n",
+	sceClibPrintf("VGL_LINK_SHARK_LOG level=%d line=%d msg=%s\n",
 		(int)msg_level, line, msg ? msg : "(null)");
 #endif
 	char newline[1024];
@@ -2091,6 +2091,9 @@ GLuint glCreateShader(GLenum shaderType) {
 
 	shaders[res] = vglCalloc(1, sizeof(shader));
 	shader *s = shaders[res];
+	if (!s) {
+		SET_GL_ERROR_WITH_RET(GL_OUT_OF_MEMORY, 0)
+	}
 	s->slot = res;
 
 	// Reserving and initializing shader slot
@@ -2702,7 +2705,7 @@ void glLinkProgram(GLuint progr) {
 				fname = vert_fname;
 #endif
 #ifdef HAVE_LINK_TRACE
-				nba2k16_dump_link_source("ux0:data/nba2k16/loader/vitagl-link-vertex.cg.log", "vertex", p->vshader);
+				vgl_link_trace_dump_source("ux0:data/vgl_link_vertex.cg.log", "vertex", p->vshader);
 				sceClibPrintf("VGL_LINK vertex_compile_begin program=%u size=%u\n",
 					(unsigned)progr, (unsigned)p->vshader->size);
 #endif
@@ -2717,7 +2720,7 @@ void glLinkProgram(GLuint progr) {
 				fname = frag_fname;
 #endif
 #ifdef HAVE_LINK_TRACE
-					nba2k16_dump_link_source("ux0:data/nba2k16/loader/vitagl-link-fragment.cg.log", "fragment", p->fshader);
+					vgl_link_trace_dump_source("ux0:data/vgl_link_fragment.cg.log", "fragment", p->fshader);
 					sceClibPrintf("VGL_LINK fragment_compile_begin program=%u size=%u\n",
 						(unsigned)progr, (unsigned)p->fshader->size);
 #endif
