@@ -596,6 +596,122 @@ static inline __attribute__((always_inline)) GLenum gxm_vd_fmt_to_gl(SceGxmAttri
 		return GL_UNSIGNED_BYTE;
 	default:
 		return GL_FLOAT;
+#ifdef HAVE_CLIENT_ARRAY_GROUPS
+	}
+}
+
+static inline __attribute__((always_inline)) uint32_t gxm_vd_fmt_size(SceGxmAttributeFormat fmt) {
+	switch (fmt) {
+	case SCE_GXM_ATTRIBUTE_FORMAT_F32:
+		return 4;
+	case SCE_GXM_ATTRIBUTE_FORMAT_F16:
+	case SCE_GXM_ATTRIBUTE_FORMAT_S16:
+	case SCE_GXM_ATTRIBUTE_FORMAT_S16N:
+	case SCE_GXM_ATTRIBUTE_FORMAT_U16:
+	case SCE_GXM_ATTRIBUTE_FORMAT_U16N:
+		return 2;
+	case SCE_GXM_ATTRIBUTE_FORMAT_S8:
+	case SCE_GXM_ATTRIBUTE_FORMAT_S8N:
+	case SCE_GXM_ATTRIBUTE_FORMAT_U8:
+	case SCE_GXM_ATTRIBUTE_FORMAT_U8N:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * The packed paths only recognize interleaved client arrays whose second
+ * attribute follows the first. Any other attribute order copies the whole
+ * vertex range once per attribute. When every active attribute is client
+ * memory with one stride and lies inside one vertex record, copy the records
+ * once from the lowest attribute and address each attribute by its offset.
+ */
+static GLboolean gather_interleaved_client_attribs(program *p, SceGxmVertexAttribute *attributes, SceGxmVertexStream *streams, void **ptrs, uint32_t first, uint32_t count) {
+	uint32_t base = 0xFFFFFFFF, stride = 0, active = 0;
+	for (int i = 0; i < p->attr_num; i++) {
+		uint8_t attr_idx = p->attr_map[i];
+		if (!(cur_vao->vertex_attrib_state & (1 << attr_idx)))
+			continue;
+		if (cur_vao->vertex_attrib_vbo[attr_idx])
+			return GL_FALSE;
+		if (stride && streams[i].stride != stride)
+			return GL_FALSE;
+		stride = streams[i].stride;
+		if (cur_vao->vertex_attrib_offsets[attr_idx] < base)
+			base = cur_vao->vertex_attrib_offsets[attr_idx];
+		active++;
+	}
+	if (active < 2 || !stride)
+		return GL_FALSE;
+	for (int i = 0; i < p->attr_num; i++) {
+		uint8_t attr_idx = p->attr_map[i];
+		if (!(cur_vao->vertex_attrib_state & (1 << attr_idx)))
+			continue;
+		uint32_t bytes = gxm_vd_fmt_size(attributes[i].format) * attributes[i].componentCount;
+		if (!bytes || cur_vao->vertex_attrib_offsets[attr_idx] - base + bytes > stride)
+			return GL_FALSE;
+	}
+	ptrs[0] = gpu_alloc_mapped_temp(count * stride);
+	vgl_fast_memcpy(ptrs[0], (void *)base + first * stride, count * stride);
+	for (int i = 0; i < p->attr_num; i++) {
+		uint8_t attr_idx = p->attr_map[i];
+		attributes[i].regIndex = p->attr[attr_idx].regIndex;
+		if (cur_vao->vertex_attrib_state & (1 << attr_idx)) {
+			attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - base;
+		} else {
+			disable_draw_attrib(i)
+		}
+	}
+	return GL_TRUE;
+}
+
+/* The unpacked path copies the whole vertex range once per client attribute.
+ * Attributes read from one client array (same stride, inside one record of a
+ * common base) share one copy here and read it at their own offsets; every
+ * other attribute is handled as before. */
+static void handle_unpacked_attribs_grouped(program *p, SceGxmVertexAttribute *attributes, SceGxmVertexStream *streams, void **ptrs, uint32_t first, uint32_t count) {
+	uint32_t grouped = 0;
+	for (int i = 0; i < p->attr_num; i++) {
+		uint8_t attr_idx = p->attr_map[i];
+		attributes[i].regIndex = p->attr[attr_idx].regIndex;
+		if (grouped & (1 << i))
+			continue;
+		uint32_t members = 0, base = 0xFFFFFFFF, stride = streams[i].stride;
+		if ((cur_vao->vertex_attrib_state & (1 << attr_idx)) && !cur_vao->vertex_attrib_vbo[attr_idx] && stride) {
+			uint32_t lead = cur_vao->vertex_attrib_offsets[attr_idx];
+			for (int j = i; j < p->attr_num; j++) {
+				uint8_t idx = p->attr_map[j];
+				uint32_t off = cur_vao->vertex_attrib_offsets[idx];
+				if ((grouped & (1 << j)) || !(cur_vao->vertex_attrib_state & (1 << idx)) || cur_vao->vertex_attrib_vbo[idx] ||
+					streams[j].stride != stride || off + stride <= lead || lead + stride <= off)
+					continue;
+				members |= 1 << j;
+				if (off < base)
+					base = off;
+			}
+			for (int j = i; j < p->attr_num && members; j++) {
+				if (!(members & (1 << j)))
+					continue;
+				uint32_t bytes = gxm_vd_fmt_size(attributes[j].format) * attributes[j].componentCount;
+				if (!bytes || cur_vao->vertex_attrib_offsets[p->attr_map[j]] - base + bytes > stride)
+					members = 0;
+			}
+		}
+		if (!(members & (members - 1))) {
+			handle_unpacked_attrib(first, count);
+			continue;
+		}
+		uint8_t *copy = gpu_alloc_mapped_temp(count * stride);
+		vgl_fast_memcpy(copy, (void *)base + first * stride, count * stride);
+		for (int j = i; j < p->attr_num; j++) {
+			if (!(members & (1 << j)))
+				continue;
+			ptrs[j] = copy;
+			attributes[j].offset = cur_vao->vertex_attrib_offsets[p->attr_map[j]] - base;
+		}
+		grouped |= members;
+#endif
 	}
 }
 
@@ -1369,12 +1485,20 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 				handle_packed_attrib();
 			}
 		}
+#ifdef HAVE_CLIENT_ARRAY_GROUPS
+	} else if (gather_interleaved_client_attribs(p, attributes, streams, ptrs, first, count)) {
+		is_packed = GL_TRUE;
+#endif
 	} else {
+#ifdef HAVE_CLIENT_ARRAY_GROUPS
+		handle_unpacked_attribs_grouped(p, attributes, streams, ptrs, first, count);
+#else
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
 			attributes[i].regIndex = p->attr[attr_idx].regIndex;
 			handle_unpacked_attrib(first, count);
 		}
+#endif
 	}
 #endif
 #else // DRAW_SPEEDHACK
@@ -1703,12 +1827,20 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				handle_packed_attrib();
 			}
 		}	
+#ifdef HAVE_CLIENT_ARRAY_GROUPS
+	} else if (gather_interleaved_client_attribs(p, attributes, streams, ptrs, 0, top_idx)) {
+		is_packed = GL_TRUE;
+#endif
 	} else {
+#ifdef HAVE_CLIENT_ARRAY_GROUPS
+		handle_unpacked_attribs_grouped(p, attributes, streams, ptrs, 0, top_idx);
+#else
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
 			attributes[i].regIndex = p->attr[attr_idx].regIndex;
 			handle_unpacked_attrib(0, top_idx);
 		}
+#endif
 	}
 #endif
 #else // DRAW_SPEEDHACK
