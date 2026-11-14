@@ -22,6 +22,7 @@
  */
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <string.h>
 #include "../shared.h"
 #include "glsl_utils.h"
@@ -42,9 +43,12 @@ static inline __attribute__((always_inline)) void glsl_buffer_reset(glsl_buffer 
 	}
 }
 
-static void glsl_buffer_reserve(glsl_buffer *buf, size_t needed) {
+// The helpers that can grow a buffer return GL_FALSE, without writing to it, when memory runs out.
+// The rewrite passes built on them (glsl_inject_mul, glsl_handle_globals, glsl_handle_ubos) return 1
+// when 'out' holds the rewritten text, 0 when the text needed no change and -1 when memory ran out.
+static GLboolean glsl_buffer_reserve(glsl_buffer *buf, size_t needed) {
 	if (needed <= buf->capacity) {
-		return;
+		return GL_TRUE;
 	}
 
 	size_t capacity = buf->capacity ? buf->capacity : GLSL_BUFFER_MIN_CAPACITY;
@@ -53,34 +57,48 @@ static void glsl_buffer_reserve(glsl_buffer *buf, size_t needed) {
 		capacity = grown > capacity ? grown : needed;
 	}
 
-	buf->data = vgl_realloc(buf->data, capacity);
+	char *data = vgl_realloc(buf->data, capacity);
+	if (!data) {
+		return GL_FALSE;
+	}
+	buf->data = data;
 	buf->capacity = capacity;
+	return GL_TRUE;
 }
 
-static inline __attribute__((always_inline)) void glsl_buffer_append(glsl_buffer *buf, const char *src, size_t len) {
-	glsl_buffer_reserve(buf, buf->len + len + 1);
+static inline __attribute__((always_inline)) GLboolean glsl_buffer_append(glsl_buffer *buf, const char *src, size_t len) {
+	if (!glsl_buffer_reserve(buf, buf->len + len + 1)) {
+		return GL_FALSE;
+	}
 	vgl_fast_memcpy(buf->data + buf->len, src, len);
 	buf->len += len;
 	buf->data[buf->len] = 0;
+	return GL_TRUE;
 }
 
-static inline __attribute__((always_inline)) void glsl_buffer_init(glsl_buffer *buf, const char *src, size_t len, size_t padding) {
+static inline __attribute__((always_inline)) GLboolean glsl_buffer_init(glsl_buffer *buf, const char *src, size_t len, size_t padding) {
 	glsl_buffer_reset(buf);
-	glsl_buffer_reserve(buf, len + padding + 1);
+	if (!glsl_buffer_reserve(buf, len + padding + 1)) {
+		return GL_FALSE;
+	}
 	vgl_fast_memcpy(buf->data, src, len);
 	buf->len = len;
 	buf->data[len] = 0;
+	return GL_TRUE;
 }
 
-static void glsl_buffer_replace(glsl_buffer *buf, size_t offset, size_t removed_len, const char *replacement, size_t replacement_len) {
+static GLboolean glsl_buffer_replace(glsl_buffer *buf, size_t offset, size_t removed_len, const char *replacement, size_t replacement_len) {
 	size_t tail = offset + removed_len;
 	size_t new_len = buf->len - removed_len + replacement_len;
-	glsl_buffer_reserve(buf, new_len + 1);
+	if (!glsl_buffer_reserve(buf, new_len + 1)) {
+		return GL_FALSE;
+	}
 	sceClibMemmove(buf->data + offset + replacement_len, buf->data + tail, buf->len - tail + 1);
 	if (replacement_len) {
 		vgl_fast_memcpy(buf->data + offset, replacement, replacement_len);
 	}
 	buf->len = new_len;
+	return GL_TRUE;
 }
 
 static inline __attribute__((always_inline)) void glsl_buffer_release(glsl_buffer *buf) {
@@ -95,26 +113,32 @@ static inline __attribute__((always_inline)) void glsl_buffer_swap(glsl_buffer *
 	*b = tmp;
 }
 
-static void glsl_replace_marker(glsl_buffer *buf, GLsizei preamble_size, const char *marker, const char *replacement) {
+static GLboolean glsl_replace_marker(glsl_buffer *buf, GLsizei preamble_size, const char *marker, const char *replacement) {
 	char *type = strstr(buf->data + preamble_size, marker);
 	size_t replacement_len = strlen(replacement);
 	while (type) {
 		size_t offset = type - buf->data;
-		glsl_buffer_replace(buf, offset, 1, replacement, replacement_len);
+		if (!glsl_buffer_replace(buf, offset, 1, replacement, replacement_len)) {
+			return GL_FALSE;
+		}
 		type = strstr(buf->data + preamble_size, marker);
 	}
+	return GL_TRUE;
 }
 
-static void glsl_replace_marker_progressive(glsl_buffer *buf, GLsizei preamble_size, const char *marker, const char *prefix, const char *suffix) {
+static GLboolean glsl_replace_marker_progressive(glsl_buffer *buf, GLsizei preamble_size, const char *marker, const char *prefix, const char *suffix) {
 	char *type = strstr(buf->data + preamble_size, marker);
 	uint8_t idx = 1;
 	while (type) {
 		char line[32];
 		int line_len = sprintf(line, "%s%u%s", prefix, idx++, suffix);
 		size_t offset = type - buf->data;
-		glsl_buffer_replace(buf, offset, 1, line, line_len);
+		if (!glsl_buffer_replace(buf, offset, 1, line, line_len)) {
+			return GL_FALSE;
+		}
 		type = strstr(buf->data + preamble_size, marker);
 	}
+	return GL_TRUE;
 }
 
 #define glsl_get_existing_texcoord_bind(idx, s) \
@@ -152,6 +176,41 @@ static void glsl_replace_marker_progressive(glsl_buffer *buf, GLsizei preamble_s
 			break; \
 		} \
 	}
+
+static size_t glsl_unused_swizzle_aliases(char *out, const char *text) {
+    static const char *names[] = {"s", "t", "st", "ts", "ss", "tt"};
+    size_t length = 0;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        size_t size = strlen(names[i]);
+        int used = 0;
+        for (const char *dot = strchr(text, '.'); dot && !used; dot = strchr(dot + 1, '.')) {
+            const char *p = dot + 1;
+            for (;;) {
+                while (isspace((unsigned char)*p)) ++p;
+                if (p[0] == '/' && p[1] == '*') {
+                    const char *end = strstr(p + 2, "*/");
+                    if (!end) break;
+                    p = end + 2;
+                } else if (p[0] == '/' && p[1] == '/') {
+                    const char *end = strchr(p + 2, '\n');
+                    if (!end) break;
+                    p = end + 1;
+                } else break;
+            }
+            used = !strncmp(p, names[i], size) &&
+                !isalnum((unsigned char)p[size]) && p[size] != '_';
+        }
+        if (!used) {
+            memcpy(out + length, "#undef ", 7);
+            length += 7;
+            memcpy(out + length, names[i], size);
+            length += size;
+            out[length++] = '\n';
+        }
+    }
+    out[length] = 0;
+    return length;
+}
 
 #ifdef HAVE_FFP_SHADER_SUPPORT
 const char *ffp_bind_defines[FFP_BINDS_NUM] = {
@@ -967,7 +1026,7 @@ ENTRY_HANDLED_GLOBAL:
  * The idea behind this is to check if a uniform is auniform block, and if so, bind to a
  * specific index.
  */
-GLboolean glsl_handle_ubos(char *txt, glsl_buffer *out, GLsizei preamble_size) {
+int glsl_handle_ubos(char *txt, glsl_buffer *out, GLsizei preamble_size) {
 	GLboolean has_ubos = GL_FALSE;
 	uint32_t ubo_count = 0;
 	char *type = strstr(txt + preamble_size, "uniform");
@@ -986,8 +1045,10 @@ GLboolean glsl_handle_ubos(char *txt, glsl_buffer *out, GLsizei preamble_size) {
 	}
 	// Second pass: replacing all marked variables
 	if (has_ubos) {
-		glsl_buffer_init(out, txt, strlen(txt), ubo_count * 16);
-		glsl_replace_marker_progressive(out, preamble_size, "\v", ": BUFFER[", "];");
+		if (!glsl_buffer_init(out, txt, strlen(txt), ubo_count * 16) ||
+			!glsl_replace_marker_progressive(out, preamble_size, "\v", ": BUFFER[", "];")) {
+			return -1;
+		}
 	}
 	return has_ubos;
 }
@@ -999,7 +1060,7 @@ GLboolean glsl_handle_ubos(char *txt, glsl_buffer *out, GLsizei preamble_size) {
  * add to it static keyword only if not uniform. This is required cause CG handles
  * global variables by default as uniforms.
  */
-GLboolean glsl_handle_globals(char *txt, glsl_buffer *out, GLsizei preamble_size) {
+int glsl_handle_globals(char *txt, glsl_buffer *out, GLsizei preamble_size) {
 	GLboolean has_globals = GL_FALSE;
 	uint32_t globals_count = 0;
 	char *src = txt;
@@ -1061,16 +1122,18 @@ HANDLE_VAR:
 	}
 	// Second pass: replacing all marked variables
 	if (has_globals) {
-		glsl_buffer_init(out, src, strlen(src), globals_count * 7);
-		glsl_replace_marker(out, preamble_size, "\vloat", "static f");
-		glsl_replace_marker(out, preamble_size, "\vnt", "static i");
-		glsl_replace_marker(out, preamble_size, "\vec", "static v");
-		glsl_replace_marker(out, preamble_size, "\vvec", "static i");
-		glsl_replace_marker(out, preamble_size, "\vat", "static m");
-		glsl_replace_marker(out, preamble_size, "\vonst", "static c");
-		glsl_replace_marker(out, preamble_size, "\vowp", "static l");
-		glsl_replace_marker(out, preamble_size, "\vediump", "static m");
-		glsl_replace_marker(out, preamble_size, "\vighp", "static h");
+		if (!glsl_buffer_init(out, src, strlen(src), globals_count * 7) ||
+			!glsl_replace_marker(out, preamble_size, "\vloat", "static f") ||
+			!glsl_replace_marker(out, preamble_size, "\vnt", "static i") ||
+			!glsl_replace_marker(out, preamble_size, "\vec", "static v") ||
+			!glsl_replace_marker(out, preamble_size, "\vvec", "static i") ||
+			!glsl_replace_marker(out, preamble_size, "\vat", "static m") ||
+			!glsl_replace_marker(out, preamble_size, "\vonst", "static c") ||
+			!glsl_replace_marker(out, preamble_size, "\vowp", "static l") ||
+			!glsl_replace_marker(out, preamble_size, "\vediump", "static m") ||
+			!glsl_replace_marker(out, preamble_size, "\vighp", "static h")) {
+			return -1;
+		}
 	}
 	return has_globals;
 }
@@ -1133,7 +1196,7 @@ void glsl_handle_tex_size(char *txt, GLsizei preamble_size, glsl_samplers_info *
  * and vector * matrix operations. This implementation is very likely non exhaustive
  * since, for a proper implementation, ideally we'd want a proper GLSL parser.
  */
-GLboolean glsl_inject_mul(char *txt, GLsizei txt_len, glsl_buffer *out, GLsizei preamble_size) {
+int glsl_inject_mul(char *txt, GLsizei txt_len, glsl_buffer *out, GLsizei preamble_size) {
 	char *star = strstr(txt + preamble_size, "*");
 	while (star) {
 		if (star[1] == '=') { // FIXME: *= still not handled
@@ -1146,7 +1209,9 @@ GLboolean glsl_inject_mul(char *txt, GLsizei txt_len, glsl_buffer *out, GLsizei 
 		return GL_FALSE;
 	}
 	const size_t star_offs = star - txt;
-	glsl_buffer_init(out, txt, txt_len, txt_len >> 2);
+	if (!glsl_buffer_init(out, txt, txt_len, txt_len >> 2)) {
+		return -1;
+	}
 	txt = out->data;
 	star = txt + star_offs;
 	glsl_buffer replacement = {};
@@ -1267,13 +1332,16 @@ LOOP_START:
 		size_t star_offset = star - txt;
 		size_t right_offset = right - txt;
 		glsl_buffer_reset(&replacement);
-		glsl_buffer_reserve(&replacement, right_offset - left_offset + 10);
-		glsl_buffer_append(&replacement, " vglMul(", 8);
-		glsl_buffer_append(&replacement, txt + left_offset, star_offset - left_offset);
-		glsl_buffer_append(&replacement, ",", 1);
-		glsl_buffer_append(&replacement, txt + star_offset + 1, right_offset - star_offset - 1);
-		glsl_buffer_append(&replacement, ")", 1);
-		glsl_buffer_replace(out, left_offset, right_offset - left_offset, replacement.data, replacement.len);
+		if (!glsl_buffer_reserve(&replacement, right_offset - left_offset + 10) ||
+			!glsl_buffer_append(&replacement, " vglMul(", 8) ||
+			!glsl_buffer_append(&replacement, txt + left_offset, star_offset - left_offset) ||
+			!glsl_buffer_append(&replacement, ",", 1) ||
+			!glsl_buffer_append(&replacement, txt + star_offset + 1, right_offset - star_offset - 1) ||
+			!glsl_buffer_append(&replacement, ")", 1) ||
+			!glsl_buffer_replace(out, left_offset, right_offset - left_offset, replacement.data, replacement.len)) {
+			glsl_buffer_release(&replacement);
+			return -1;
+		}
 		txt = out->data;
 		star = strstr(txt + preamble_size, "*");
 	} else { // [ bracket match, we assume a matrix is not involved
@@ -1290,7 +1358,14 @@ LOOP_START:
 	return GL_TRUE;
 }
 
-void glsl_translator_process(shader *s) {
+GLboolean glsl_translator_process(shader *s) {
+    char *original = s->source;
+    char *input = NULL, *prepared = NULL, *final = NULL;
+    glsl_buffer work_a = {};
+    glsl_buffer work_b = {};
+    binds_map bindings_before = glsl_bindings_map;
+    GLboolean first_before = glsl_is_first_shader;
+    int reference_before = glsl_current_ref_idx;
 #ifdef HAVE_FIXED_ATTRIBUTES
 	glsl_attributes_num = 0;
 #endif
@@ -1312,7 +1387,8 @@ void glsl_translator_process(shader *s) {
 	if (s->type == GL_VERTEX_SHADER)
 		size += strlen("#define VGL_IS_VERTEX_SHADER\n");
 	
-	char *input = vglMalloc(source_size);
+	input = vglMalloc(source_size);
+	if (!input) goto allocation_failed;
 	vgl_fast_memcpy(input, s->source, source_size - 1);
 	input[source_size - 1] = 0;
 	
@@ -1334,7 +1410,10 @@ void glsl_translator_process(shader *s) {
 #endif
 
 	char *out = glsl_preprocessor_run("full", input);
-	vgl_free(input);
+	vgl_free(input); input = NULL;
+    /* An unused component alias must not rename unrelated shader locals. */
+    char unused_swizzle_aliases[64];
+    size += glsl_unused_swizzle_aliases(unused_swizzle_aliases, out);
 #ifdef DEBUG_GLSL_PREPROCESSOR
 	vgl_log("%s:%d %s: GLSL preprocessor output:\n\n%s\n\n", __FILE__, __LINE__, __func__, out);
 #endif
@@ -1403,8 +1482,9 @@ void glsl_translator_process(shader *s) {
 			size += strlen("varying in float4 gl_Color : COLOR;\n");
 	}
 	
-	vgl_free(s->source);
-	s->source = (char *)vglMalloc(size);
+	prepared = vglMalloc(size);
+	if (!prepared) goto allocation_failed;
+	s->source = prepared;
 	s->source[0] = 0;
 	
 	// Injecting GLSL to CG header
@@ -1431,6 +1511,7 @@ void glsl_translator_process(shader *s) {
 			strcat(s->source, "varying in float4 gl_Color : COLOR;\n");
 	}
 	strcat(s->source, glsl_hdr);
+	strcat(s->source, unused_swizzle_aliases);
 	if (glsl_precision_low)
 		strcat(s->source, glsl_precision_hdr);
 	
@@ -1572,34 +1653,46 @@ void glsl_translator_process(shader *s) {
 		for (int i = 0; i < glsl_attributes_num; i++) {
 			char inj[256];
 			int inj_len = sprintf(inj, "%s=vglUnpack(%s);", glsl_attributes[i], glsl_attributes[i]);
-			glsl_buffer_append(&injected, inj, inj_len);
+			if (!glsl_buffer_append(&injected, inj, inj_len)) {
+				glsl_buffer_release(&injected);
+				goto allocation_failed;
+			}
 		}
 		glsl_buffer fixed = {0};
-		glsl_buffer_init(&fixed, s->source, strlen(s->source), injected.len);
-		glsl_buffer_replace(&fixed, insert_offset, 0, injected.data, injected.len);
+		if (!glsl_buffer_init(&fixed, s->source, strlen(s->source), injected.len) ||
+			!glsl_buffer_replace(&fixed, insert_offset, 0, injected.data, injected.len)) {
+			glsl_buffer_release(&injected);
+			glsl_buffer_release(&fixed);
+			goto allocation_failed;
+		}
 		glsl_buffer_release(&injected);
-		vgl_free(s->source);
-		s->source = fixed.data;
+		vgl_free(prepared);
+		prepared = fixed.data;
+		s->source = prepared;
 	}
 #endif
 
-	glsl_buffer work_a = {};
-	glsl_buffer work_b = {};
 	GLsizei src_len = strlen(s->source);
-	glsl_buffer_init(&work_a, s->source, src_len, 0);
-	vgl_free(s->source);
+	if (!glsl_buffer_init(&work_a, s->source, src_len, 0)) goto allocation_failed;
+	vgl_free(prepared); prepared = NULL;
 
 	// Manually handle * operator replacements for vector * matrix and matrix * vector operations support
-	if (glsl_inject_mul(work_a.data, src_len, &work_b, preamble_size)) {
+	int rewritten = glsl_inject_mul(work_a.data, src_len, &work_b, preamble_size);
+	if (rewritten < 0) goto allocation_failed;
+	if (rewritten) {
 		glsl_buffer_swap(&work_a, &work_b);
 	}
 	// Manually handle global variables, adding "static" to them
-	if (glsl_handle_globals(work_a.data, &work_b, preamble_size)) {
+	rewritten = glsl_handle_globals(work_a.data, &work_b, preamble_size);
+	if (rewritten < 0) goto allocation_failed;
+	if (rewritten) {
 		glsl_buffer_swap(&work_a, &work_b);
 	}
 #ifdef HAVE_GLSL_UBOS
 	// Manually handle ubos
-	if (glsl_handle_ubos(work_a.data, &work_b, preamble_size)) {
+	rewritten = glsl_handle_ubos(work_a.data, &work_b, preamble_size);
+	if (rewritten < 0) goto allocation_failed;
+	if (rewritten) {
 		glsl_buffer_swap(&work_a, &work_b);
 	}
 #endif
@@ -1609,20 +1702,23 @@ void glsl_translator_process(shader *s) {
 	glsl_handle_tex_size(work_a.data, preamble_size, s->sized_samplers, &s->sized_samplers_num);
 	if (s->sized_samplers_num > 0) {
 		glsl_buffer_reset(&work_b);
-		glsl_buffer_reserve(&work_b, work_a.len + (s->sized_samplers_num * 32) + 1);
+		if (!glsl_buffer_reserve(&work_b, work_a.len + (s->sized_samplers_num * 32) + 1)) goto allocation_failed;
 		for (uint8_t i = 0; i < s->sized_samplers_num; i++) {
 			char sampler_decl[32];
 			int sampler_decl_len = sprintf(sampler_decl, "uniform float2 vgl_smp%u;\n", i);
-			glsl_buffer_append(&work_b, sampler_decl, sampler_decl_len);
+			if (!glsl_buffer_append(&work_b, sampler_decl, sampler_decl_len)) goto allocation_failed;
 		}
-		glsl_buffer_append(&work_b, work_a.data, work_a.len);
+		if (!glsl_buffer_append(&work_b, work_a.data, work_a.len)) goto allocation_failed;
 		glsl_buffer_swap(&work_a, &work_b);
 	}
 #endif
-	glsl_buffer_release(&work_b);
-	
+
 	// Keep only the actually used amount of mem alive
-	s->source = vgl_realloc(work_a.data, work_a.len + 1);
+	final = vgl_realloc(work_a.data, work_a.len + 1);
+	if (!final) goto allocation_failed;
+	glsl_buffer_release(&work_b);
+	vgl_free(original);
+	s->source = final;
 #ifdef DEBUG_GLSL_TRANSLATOR
 	vgl_log("%s:%d %s: GLSL translation output (%s shader):\n\n%s\n\n", __FILE__, __LINE__, __func__, glsl_is_first_shader ? "first" : "second", s->source);
 #endif
@@ -1637,12 +1733,23 @@ void glsl_translator_process(shader *s) {
 	}
 	s->size = strlen(s->source);
 	s->is_glsl = GL_FALSE;
+    return GL_TRUE;
+allocation_failed:
+    vgl_free(input); vgl_free(prepared);
+    glsl_preprocessor_clean();
+    glsl_buffer_release(&work_a); glsl_buffer_release(&work_b);
+    s->source = original;
+    glsl_bindings_map = bindings_before;
+    glsl_is_first_shader = first_before;
+    glsl_current_ref_idx = reference_before;
+    vgl_error = GL_OUT_OF_MEMORY;
+    return GL_FALSE;
 }
 
-void glsl_translator_set_process(shader *vs, shader *fs) {
-	if (vs->prog || fs->prog) {
+GLboolean glsl_translator_set_process(shader *vs, shader *fs) {
+	if (vs->prog || !vs->is_glsl || fs->prog || !fs->is_glsl) {
 		glsl_is_first_shader = GL_FALSE;
-		if (vs->prog) {
+		if (vs->prog || !vs->is_glsl) {
 			vgl_fast_memcpy(&glsl_bindings_map, &vs->semantics, sizeof(binds_map));
 #ifdef DEBUG_GLSL_TRANSLATOR
 			vgl_log("%s:%d %s: Overloading semantic bindings with precompiled vertex shader ones.\n", __FILE__, __LINE__, __func__);
@@ -1654,10 +1761,7 @@ void glsl_translator_set_process(shader *vs, shader *fs) {
 #endif
 		}
 	}
-	if (!vs->prog) {
-		glsl_translator_process(vs);
-	}
-	if (!fs->prog) {
-		glsl_translator_process(fs);
-	}
+	if (!vs->prog && vs->is_glsl && !glsl_translator_process(vs)) return GL_FALSE;
+	if (!fs->prog && fs->is_glsl && !glsl_translator_process(fs)) return GL_FALSE;
+	return GL_TRUE;
 }

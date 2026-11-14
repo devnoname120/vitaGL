@@ -1800,7 +1800,13 @@ void processFile(string fname, map<string,Var> &vars, const list<string> &includ
     // For Unix lines will be terminated with \n, for Windows with \r\n
     // ----------------------------------------------------------------------
 
-    char* source = (char *)fname.c_str();
+    // This entry receives in-memory GLSL, not a filesystem pathname. Keep
+    // the mutable input separate from the short diagnostic filename; passing
+    // the whole shader through line metadata copies/searches it for each line.
+    string source_text;
+    source_text.swap(fname);
+    fname = "<shader>";
+    char* source = &source_text[0];
 
     if (g_debug)
     {
