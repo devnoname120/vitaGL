@@ -50,16 +50,8 @@ extern int frame_purge_idx; // Index for currently populatable purge list
 extern int frame_elem_purge_idx; // Index for currently populatable purge list element
 extern int frame_rt_purge_idx; // Index for currently populatable purge list rendertarget
 
-// Macro to mark a pointer or a rendertarget as dirty for garbage collection
-#ifdef DEBUG_GC
-#define mark_as_dirty(x) \
-	if (frame_elem_purge_idx >= FRAME_PURGE_LIST_SIZE) { \
-		vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_LIST_SIZE.\n", __FILE__, __LINE__); \
-	} \
-	frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = x
-#else
-#define mark_as_dirty(x) frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = x
-#endif
+void vgl_gc_mark_dirty(void *ptr);
+#define mark_as_dirty(x) vgl_gc_mark_dirty((void *)(x))
 #ifdef HAVE_SHARED_RENDERTARGETS
 typedef struct {
 	SceGxmRenderTarget *rt;

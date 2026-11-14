@@ -42,6 +42,112 @@ void *__real_memalign(uint32_t alignment, uint32_t size);
 void *__real_realloc(void *ptr, uint32_t size);
 #endif
 
+#define VGL_GC_SPILL_CHUNK_ITEMS 1024
+#define VGL_GC_SPILL_MAX_CHUNKS 256
+
+typedef struct vgl_gc_spill_chunk {
+	struct vgl_gc_spill_chunk *next;
+	size_t count;
+	void *items[VGL_GC_SPILL_CHUNK_ITEMS];
+} vgl_gc_spill_chunk;
+
+typedef struct {
+	vgl_gc_spill_chunk *head;
+	vgl_gc_spill_chunk *tail;
+	size_t chunk_count;
+	size_t dropped;
+} vgl_gc_spill_queue;
+
+static vgl_gc_spill_queue frame_purge_spill[FRAME_PURGE_FREQ];
+
+static void *vgl_gc_metadata_alloc(size_t size) {
+#ifdef HAVE_WRAPPED_ALLOCATORS
+	return __real_calloc(1, size);
+#else
+	return calloc(1, size);
+#endif
+}
+
+static void vgl_gc_metadata_free(void *ptr) {
+#ifdef HAVE_WRAPPED_ALLOCATORS
+	__real_free(ptr);
+#else
+	free(ptr);
+#endif
+}
+
+static int vgl_gc_spill_push(vgl_gc_spill_queue *queue, void *ptr) {
+	if (!queue || !ptr)
+		return 0;
+
+	vgl_gc_spill_chunk *chunk = queue->tail;
+	if (!chunk || chunk->count == VGL_GC_SPILL_CHUNK_ITEMS) {
+		if (queue->chunk_count == VGL_GC_SPILL_MAX_CHUNKS) {
+			queue->dropped++;
+			return 0;
+		}
+		chunk = vgl_gc_metadata_alloc(sizeof(*chunk));
+		if (!chunk) {
+			queue->dropped++;
+			return 0;
+		}
+		if (queue->tail)
+			queue->tail->next = chunk;
+		else
+			queue->head = chunk;
+		queue->tail = chunk;
+		queue->chunk_count++;
+	}
+	chunk->items[chunk->count++] = ptr;
+	return 1;
+}
+
+static int vgl_gc_release_spill_sentinel(void *ptr, void (*release)(void *)) {
+	for (size_t row = 0; row < FRAME_PURGE_FREQ; row++) {
+		vgl_gc_spill_queue *queue = &frame_purge_spill[row];
+		if (ptr != queue)
+			continue;
+
+		vgl_gc_spill_chunk *chunk = queue->head;
+		while (chunk) {
+			vgl_gc_spill_chunk *next = chunk->next;
+			if (release) {
+				for (size_t i = 0; i < chunk->count; i++)
+					release(chunk->items[i]);
+			}
+			vgl_gc_metadata_free(chunk);
+			chunk = next;
+		}
+#ifdef DEBUG_GC
+		if (queue->dropped)
+			vgl_log("Garbage collector spill dropped %u deferred frees.\n", (unsigned)queue->dropped);
+#endif
+		queue->head = NULL;
+		queue->tail = NULL;
+		queue->chunk_count = 0;
+		queue->dropped = 0;
+		return 1;
+	}
+	return 0;
+}
+
+void vgl_gc_mark_dirty(void *ptr) {
+	if (!ptr || (unsigned)frame_purge_idx >= FRAME_PURGE_FREQ)
+		return;
+
+	const int primary_capacity = FRAME_PURGE_LIST_SIZE - 1;
+	if (frame_elem_purge_idx < primary_capacity) {
+		frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = ptr;
+		return;
+	}
+
+	vgl_gc_spill_queue *queue = &frame_purge_spill[frame_purge_idx];
+	if (frame_elem_purge_idx == primary_capacity)
+		frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = queue;
+	if (vgl_gc_spill_push(queue, ptr))
+		frame_elem_purge_idx++;
+}
+
 #ifdef HAVE_CUSTOM_HEAP
 
 // Lightweighted mutexes for thread-safeness
@@ -670,6 +776,8 @@ void vgl_free(void *ptr) {
 	if (!ptr)
 		return;
 
+	if (vgl_gc_release_spill_sentinel(ptr, vgl_free))
+		return;
 	vglMemType type = vgl_mem_get_type_by_addr(ptr);
 	if (type == VGL_MEM_EXTERNAL)
 #ifdef HAVE_WRAPPED_ALLOCATORS
