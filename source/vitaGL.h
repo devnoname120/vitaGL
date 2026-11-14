@@ -90,7 +90,6 @@ extern "C" {
 #define GL_POLYGON                                      0x0009
 #define GL_ADD                                          0x0104
 #define GL_NEVER                                        0x0200
-#define GL_NEVER                                        0x0200
 #define GL_LESS                                         0x0201
 #define GL_EQUAL                                        0x0202
 #define GL_LEQUAL                                       0x0203
@@ -338,6 +337,7 @@ extern "C" {
 #define GL_NUM_EXTENSIONS                               0x821D
 #define GL_RG                                           0x8227
 #define GL_R8                                           0x8229
+#define GL_RG8                                          0x822B
 #define GL_QUERY_TARGET                                 0x82EA
 #define GL_UNSIGNED_SHORT_5_6_5                         0x8363
 #define GL_UNSIGNED_SHORT_1_5_5_5_REV                   0x8366
@@ -413,6 +413,8 @@ extern "C" {
 #define GL_PROGRAM_ERROR_POSITION_ARB                   0x864B
 #define GL_NUM_COMPRESSED_TEXTURE_FORMATS               0x86A2
 #define GL_COMPRESSED_TEXTURE_FORMATS                   0x86A3
+#define GL_DOT3_RGB                                     0x86AE
+#define GL_DOT3_RGBA                                    0x86AF
 #define GL_PROGRAM_BINARY_LENGTH                        0x8741
 #define GL_MIRROR_CLAMP_EXT                             0x8742
 #define GL_BUFFER_SIZE                                  0x8764
@@ -456,6 +458,7 @@ extern "C" {
 #define GL_MAX_FRAGMENT_UNIFORM_COMPONENTS              0x8B49
 #define GL_MAX_VERTEX_UNIFORM_COMPONENTS                0x8B4A
 #define GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS               0x8B4C
+#define GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS             0x8B4D
 #define GL_SHADER_TYPE                                  0x8B4F
 #define GL_FLOAT_VEC2                                   0x8B50
 #define GL_FLOAT_VEC3                                   0x8B51
@@ -520,22 +523,22 @@ extern "C" {
 #define GL_COLOR_ATTACHMENT0                            0x8CE0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE           0x8CD0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME           0x8CD1
+#define GL_FRAMEBUFFER_COMPLETE                         0x8CD5
+#define GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT    0x8CD7
 #define GL_MAX_COLOR_ATTACHMENTS                        0x8CDF
 #define GL_DEPTH_ATTACHMENT                             0x8D00
 #define GL_STENCIL_ATTACHMENT                           0x8D20
+#define GL_FRAMEBUFFER                                  0x8D40
+#define GL_RENDERBUFFER                                 0x8D41
+#define GL_STENCIL_INDEX8                               0x8D48
+#define GL_HALF_FLOAT_OES                               0x8D61
+#define GL_ETC1_RGB8_OES                                0x8D64
+#define GL_ANY_SAMPLES_PASSED_CONSERVATIVE              0x8D6A
 #define GL_DEPTH_COMPONENT32F                           0x8DAB
 #define GL_DEPTH32F_STENCIL8                            0x8DAC
 #define GL_FRAMEBUFFER_SRGB                             0x8DB9
 #define GL_COMPRESSED_RED_RGTC1                         0x8DBB
 #define GL_COMPRESSED_RG_RGTC2                          0x8DBD
-#define GL_FRAMEBUFFER_COMPLETE                         0x8CD5
-#define GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT    0x8CD7
-#define GL_FRAMEBUFFER                                  0x8D40
-#define GL_RENDERBUFFER                                 0x8D41
-#define GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS             0x8B4D
-#define GL_HALF_FLOAT_OES                               0x8D61
-#define GL_ETC1_RGB8_OES                                0x8D64
-#define GL_ANY_SAMPLES_PASSED_CONSERVATIVE              0x8D6A
 #define GL_SHADER_BINARY_FORMATS                        0x8DF8
 #define GL_NUM_SHADER_BINARY_FORMATS                    0x8DF9
 #define GL_SHADER_COMPILER                              0x8DFA
@@ -788,6 +791,7 @@ void glFogxv(GLenum pname, const GLfixed *params);
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
 void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level);
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+void glFramebufferTexture2DMultisample(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLsizei samples);
 void glFrontFace(GLenum mode);
 void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble nearVal, GLdouble farVal);
 void glFrustumf(GLfloat left, GLfloat right, GLfloat bottom, GLfloat top, GLfloat nearVal, GLfloat farVal);
@@ -819,6 +823,7 @@ void glGetProgramBinary(GLuint program, GLsizei bufSize, GLsizei *length, GLenum
 void glGetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei *length, GLchar *infoLog);
 void glGetProgramiv(GLuint program, GLenum pname, GLint *params);
 void glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params);
+void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params);
 void glGetShaderInfoLog(GLuint handle, GLsizei maxLength, GLsizei *length, GLchar *infoLog);
 void glGetShaderiv(GLuint handle, GLenum pname, GLint *params);
 void glGetShaderSource(GLuint handle, GLsizei bufSize, GLsizei *length, GLchar *source);
@@ -1072,7 +1077,7 @@ void vglColorPointer(GLint size, GLenum type, GLsizei stride, GLuint count, cons
 void vglColorPointerMapped(GLenum type, const GLvoid *pointer);
 
 // Performs a draw with the legacy vgl* draw pipeline.
-void vglDrawObjects(GLenum mode, GLsizei count, GLboolean implicit_wvp);
+void vglDrawObjects(GLenum mode, GLsizei count);
 
 // Sets up the index list to use for the subsequent legacy vgl* draw pipeline draw action.
 void vglIndexPointer(GLenum type, GLsizei stride, GLuint count, const GLvoid *pointer);
@@ -1114,7 +1119,7 @@ void vglGetShaderBinary(GLuint index, GLsizei bufSize, GLsizei *length, void *bi
 typedef enum {
 	VGL_MEM_VRAM, // CDRAM
 	VGL_MEM_RAM, // USER_RW RAM
-	VGL_MEM_SLOW, // PHYCONT_USER_RW RAM
+	VGL_MEM_PHYCONT, // PHYCONT_USER_RW RAM
 	VGL_MEM_BUDGET, // CDLG RAM
 	VGL_MEM_EXTERNAL, // newlib mem
 	VGL_MEM_ALL
@@ -1123,9 +1128,12 @@ typedef enum {
 typedef enum {
 	VGL_TYPE_NONE, // No semantic
 	VGL_TYPE_TEXCOORD, // TEXCOORD#
+	VGL_TYPE_TEXCOORD_CENTROID, // TEXCOORD#_CENTROID
 	VGL_TYPE_COLOR, // COLOR#
+	VGL_TYPE_COLOR_CENTROID, // COLOR#_CENTROID
 	VGL_TYPE_FOG, // FOG
-	VGL_TYPE_CLIP // CLP#
+	VGL_TYPE_FOG_CENTROID, // FOG_CENTROID
+	VGL_TYPE_CLIP, // CLP#
 } vglSemanticType;
 
 typedef enum {
@@ -1133,6 +1141,16 @@ typedef enum {
 	VGL_MODE_GLOBAL, // Uses a global semantics pool for translating shaders. Less accuracy than VGL_MODE_SHADER_PAIR but has no premise that must be respected.
 	VGL_MODE_POSTPONED // Moves shaders compilation into glLinkProgram. Best results since will always have correct shader couples for the translation for accurate semantic bindings resolution.
 } vglSemanticMode;
+
+typedef struct {
+	SceGxmContext *context; // Usable gxm context during a custom splashscreen rendering
+	SceGxmShaderPatcher *patcher; // Usable gxm shader patcher during a custom splashscreen rendering
+	float elapsed_seconds; // Elapsed time since splashscreen start in seconds
+	float delta_seconds; // Elapsed time since previous splahscreen frame in seconds
+	GLboolean must_stop; // Flag whether splashscreen is supposed to end
+} vglSplashDetails;
+
+typedef GLboolean (*vglSplashCallback)(const vglSplashDetails *details);
 
 // vgl*
 // Add a new global custom semantic binding for the GLSL translator.
@@ -1154,7 +1172,10 @@ void vglBufferData(GLenum target, const GLvoid *data);
 void *vglCalloc(uint32_t nmember, uint32_t size);
 
 // Alloc memory from vitaGL internal memory pools. If the memory pools exhausted, vitaGL will attempt to free enough memory to not fail this allocation. Needs to be freed with vglFree.
-void *vglForceAlloc(uint32_t size);
+void *vglForceAlloc(uint32_t size, GLboolean for_gpu);
+
+// Alloc aligned memory from vitaGL internal memory pools. If the memory pools exhausted, vitaGL will attempt to free enough memory to not fail this allocation. Needs to be freed with vglFree.
+void *vglForceAllocAligned(uint32_t alignment, uint32_t size, GLboolean for_gpu);
 
 // Frees a previously allocated memory block in the vitaGL internal memory pools.
 void vglFree(void *addr);
@@ -1176,6 +1197,9 @@ void *vglGetProcAddress(const char *name);
 
 // Get the internal texture data pointer of a GL texture.
 void *vglGetTexDataPointer(GLenum target);
+
+// Get the internal texture palette data pointer of a GL texture.
+void *vglGetTexPaletteDataPointer(GLenum target);
 
 // Simple vitaGL init function. Legacy pool size is the amount of memory to reserve to handle immediate mode usage.
 GLboolean vglInit(int legacy_pool_size);
@@ -1207,11 +1231,20 @@ size_t vglMemFree(vglMemType type);
 // Gets the total amount of free and used memory in a given internal memory pool.
 size_t vglMemTotal(vglMemType type);
 
+// Setups a GL texture with custom internal values.
+void vglSetupTexture(GLenum target, void *data, SceGxmTextureFormat format, SceGxmTextureType type, GLsizei width, GLsizei height, GLsizei mip_count);
+
 // Replaces original texture data pointer with a new one in a GL texture.
 void vglOverloadTexDataPointer(GLenum target, void *data);
 
+// Replaces original texture palette data pointer with a new one in a GL texture.
+void vglOverloadTexPaletteDataPointer(GLenum target, void *data);
+
 // Allows to override texture format of a GL texture. Requires HAVE_UNPURE_TEXFORMATS.
 void vglOverrideTexFormat(GLenum target);
+
+// Allows to init phycont memory heap (VGL_MEM_PHYCONT) after vglInit* calls. Useful for when SceAvPlayer is used only for an intro video.
+void vglPhycontMemLazyInit(size_t size);
 
 // Variant of glReadPixels that uses GPU underneat to perform the readback. The passed data pointer must be GPU mapped (eg: heap memory).
 void vglReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *data);
@@ -1221,6 +1254,9 @@ void *vglRealloc(void *ptr, uint32_t size);
 
 // Change the total memory to use for internal circular pools to use in vitaGL. Disabled with NO_CIRCULAR_POOL. Default value: 32 * 1024 * 1024.
 void vglSetCircularPoolSize(uint32_t size);
+
+// Set color for the commit hash text during a custom splashscreen rendering
+void vglSetCustomSplashscreenHashColor(float r, float g, float b, float a);
 
 // Sets the number of buffers to use for the display swapchain. Default value: 3.
 void vglSetDisplayBufferCount(int count);
@@ -1237,6 +1273,15 @@ void vglSetParamBufferSize(uint32_t size);
 // Change the currently used semantics binding resolution mode for the GLSL translator. Default value: VGL_MODE_POSTPONED.
 void vglSetSemanticBindingMode(GLenum mode);
 
+// Sets path where to save shader association data for Razor. If an empty string is supplied, shader association data is disabled. Default value: "".
+void vglSetShaderAssociationPath(const char *path);
+
+// Overloads the shader cache path when HAVE_SHADER_CACHE=1 is used. Must be called before vglInit*. Default value: ux0:data/shader_cache.
+void vglSetShaderCachePath(const char *path);
+
+// Overloads the default vitaGL boot splashscreen with a custom one. Not compatible with NO_SPLASHSCREEN=1.
+void vglSetupCustomSplashscreen(vglSplashCallback init_callback, vglSplashCallback term_callback, vglSplashCallback main_callback, GLboolean clear_screen);
+
 // Change the lifetime for a texture to be considered cacheable. Requires HAVE_TEXTURE_CACHE.
 void vglSetTextureCacheFrequency(GLuint freq);
 
@@ -1252,11 +1297,11 @@ void vglSetVertexAttribPoolSize(uint32_t main_size, uint32_t aux_size);
 // Setup the vertex ring buffer size of sceGxm. Must be called before vglInit*. Default value: SCE_GXM_DEFAULT_VERTEX_RING_BUFFER_SIZE.
 void vglSetVertexBufferSize(uint32_t size);
 
-// Change the scenes per frame value to use for the display rendertarget. Default value: 1
-void vglSetupDisplayRenderTarget(uint8_t size);
-
 // Change the priority and affinity to use for the garbage collector thread. Must be called before vglInit*.
 void vglSetupGarbageCollector(int priority, int affinity);
+
+// Change the scenes per frame value to use for the display and fbos rendertargets. Default value: 1, 1.
+void vglSetupRenderTargetScenesNum(uint8_t display_size, uint8_t fbo_size);
 
 // Change what kind of vertex buffer objects are considered eligible for scratch memory usage in order to reduce allocation costs. Requires USE_SCRATCH_MEMORY.
 void vglSetupScratchMemory(GLboolean scratch_for_dynamic, GLboolean scratch_for_stream);

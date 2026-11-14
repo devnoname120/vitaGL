@@ -491,6 +491,7 @@ static inline __attribute__((always_inline)) void _glTexImage2D_CubeIMPL(texture
 		}
 		break;
 	case GL_RG:
+	case GL_RG8:
 	case GL_LUMINANCE_ALPHA:
 		switch (type) {
 		case GL_UNSIGNED_BYTE:
@@ -607,7 +608,10 @@ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture
 	case GL_ALPHA:
 		switch (type) {
 		case GL_UNSIGNED_BYTE:
-			read_cb = read_r8;
+			if (internalFormat == GL_RED || internalFormat == GL_ALPHA)
+				fast_store = GL_TRUE;
+			else
+				read_cb = read_r8;
 			data_bpp = 1;
 			break;
 		default:
@@ -628,10 +632,14 @@ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture
 		}
 		break;
 	case GL_RG:
+	case GL_RG8:
 		switch (type) {
 		case GL_UNSIGNED_BYTE:
-			read_cb = read_rg88;
 			data_bpp = 2;
+			if (internalFormat == GL_RG || internalFormat == GL_RG8)
+				fast_store = GL_TRUE;
+			else
+				read_cb = read_rg88;
 			break;
 		default:
 			SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, type)
@@ -841,6 +849,11 @@ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture
 	case GL_LUMINANCE:
 		tex->write_cb = write_r8;
 		tex_format = SCE_GXM_TEXTURE_FORMAT_L8;
+		break;
+	case GL_RG:
+	case GL_RG8:
+		tex->write_cb = write_rg88;
+		tex_format = SCE_GXM_TEXTURE_FORMAT_U8U8_GR;
 		break;
 	case GL_SLUMINANCE_ALPHA:
 	case GL_SLUMINANCE8_ALPHA8:
@@ -1061,6 +1074,7 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
 		}
 		break;
 	case GL_RG:
+	case GL_RG8:
 		switch (type) {
 		case GL_UNSIGNED_BYTE:
 			read_cb = read_rg88;
@@ -1147,6 +1161,12 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
 	case GL_TEXTURE_2D:
 		// Detecting proper write callback
 		switch (tex_format) {
+		case SCE_GXM_TEXTURE_FORMAT_U8U8_GR:
+			if ((uintptr_t)read_cb == (uintptr_t)read_rg88)
+				fast_store = GL_TRUE;
+			else
+				write_cb = write_rg88;
+			break;
 		case SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR:
 			if ((uintptr_t)read_cb == (uintptr_t)read_rgb888)
 				fast_store = GL_TRUE;
@@ -1700,6 +1720,8 @@ inline __attribute__((always_inline)) void glGenTextures(GLsizei n, GLuint *res)
 	// Error handling
 	if (n < 0) {
 		SET_GL_ERROR(GL_INVALID_VALUE)
+	} else if (n == 0) {
+		return;
 	}
 #endif
 
@@ -1795,7 +1817,7 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
 		if (i > 0 && i < TEXTURES_NUM) {
 			switch (texture_slots[i].status) {
 			case TEX_VALID:
-				if (texture_slots[i].ref_counter > 0)
+				if (texture_slots[i].ref_counter > 0) {
 					if (texture_slots[i].ref_counter == 1) {
 						framebuffer *fb = NULL;
 						if (active_read_fb && active_read_fb->tex == &texture_slots[i])
@@ -1804,23 +1826,27 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
 							fb = active_write_fb;
 						if (fb) {
 							gpu_free_texture(&texture_slots[i]);
-							if (fb->depthbuffer_ptr && fb->is_depth_hidden) {
-								mark_as_dirty(fb->depthbuffer_ptr->depthData);
+							if (fb->depthbuffer_ptr) {
+#ifndef DEPTH_STENCIL_HACK
+								mark_depth_stencil_as_dirty(fb->depthbuffer_ptr);
+#endif
 								fb->depthbuffer_ptr = NULL;
-								fb->is_depth_hidden = GL_FALSE;
+								fb->depthbuffer_state = DEPTHBUFFER_MISSING;
 							}
 							if (fb->target) {
 								mark_rt_as_dirty(fb->target);
 								fb->target = NULL;
 							}
 							fb->tex = NULL;
-						} else
+						} else {
 							texture_slots[i].dirty = GL_TRUE;
+						}
 					} else {
 						texture_slots[i].dirty = GL_TRUE;
 					}
-				else
+				} else {
 					gpu_free_texture(&texture_slots[i]);
+				}
 				break;
 			case TEX_UNINITIALIZED:
 				texture_slots[i].status = TEX_UNUSED;
@@ -2140,7 +2166,7 @@ void glActiveTexture(GLenum texture) {
 
 	// Changing current in use server texture unit
 #ifndef SKIP_ERROR_HANDLING
-	if ((texture < GL_TEXTURE0) && (texture > GL_TEXTURE15)) {
+	if ((texture < GL_TEXTURE0) || (texture > GL_TEXTURE15)) {
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, texture)
 	} else
 #endif
@@ -2670,6 +2696,88 @@ void *vglGetTexDataPointer(GLenum target) {
 	}
 }
 
+void *vglGetTexPaletteDataPointer(GLenum target) {
+	// Aliasing texture unit for cleaner code
+	texture_unit *tex_unit = &texture_units[server_texture_unit];
+	int texture2d_idx;
+	resolve_tex_target(target, SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, NULL));
+	texture *tex = &texture_slots[texture2d_idx];
+
+	switch (target) {
+	case GL_TEXTURE_CUBE_MAP:
+	case GL_TEXTURE_2D:
+#ifdef HAVE_UNPURE_TEXFORMATS
+	case GL_TEXTURE_1D:
+#endif
+		return tex->palette_data;
+	default:
+		SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, NULL)
+	}
+}
+
+void vglSetupTexture(GLenum target, void *data, SceGxmTextureFormat format, SceGxmTextureType type, GLsizei width, GLsizei height, GLsizei mip_count) {
+	// Aliasing texture unit for cleaner code
+	texture_unit *tex_unit = &texture_units[server_texture_unit];
+	int texture2d_idx;
+	resolve_tex_target(target, SET_GL_ERROR(GL_INVALID_ENUM));
+	texture *tex = &texture_slots[texture2d_idx];
+
+#ifndef SKIP_ERROR_HANDLING
+	if (!data || width <= 0 || height <= 0 || mip_count <= 0 || mip_count > 16) {
+		SET_GL_ERROR(GL_INVALID_VALUE)
+	}
+#endif
+
+	SceGxmTexture new_tex;
+	switch (type) {
+	case SCE_GXM_TEXTURE_SWIZZLED:
+		sceGxmTextureInitSwizzled(&new_tex, data, format, width, height, mip_count);
+		break;
+	case SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY:
+		vglInitSwizzledTexture(&new_tex, data, format, width, height, mip_count);
+		break;
+	case SCE_GXM_TEXTURE_LINEAR:
+		vglInitLinearTexture(&new_tex, data, format, width, height, mip_count);
+		break;
+	case SCE_GXM_TEXTURE_TILED:
+		sceGxmTextureInitTiled(&new_tex, data, format, width, height, mip_count);
+		break;
+	case SCE_GXM_TEXTURE_CUBE:
+		vglInitCubeTexture(&new_tex, data, format, width, height, mip_count);
+		break;
+	default:
+		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, type)
+	}
+
+	// Preserve GL sampler state across the descriptor replacement.
+	vglSetTexUMode(&new_tex, tex->u_mode);
+	vglSetTexVMode(&new_tex, tex->v_mode);
+	vglSetTexMinFilter(&new_tex, tex->min_filter);
+	vglSetTexMagFilter(&new_tex, tex->mag_filter);
+	vglSetTexMipFilter(&new_tex, tex->mip_filter);
+	vglSetTexLodBias(&new_tex, tex->lod_bias);
+	vglSetTexMipmapCount(&new_tex, tex->use_mips ? mip_count : 0);
+
+	if (tex->status == TEX_VALID) {
+		gpu_free_texture_data(tex);
+	}
+	tex->gxm_tex = new_tex;
+	tex->data = data;
+	tex->palette_data = NULL;
+	tex->format = format;
+	tex->mip_count = mip_count;
+	tex->faces_counter = 0;
+	tex->dirty = GL_FALSE;
+	tex->write_cb = NULL;
+	tex->status = TEX_VALID;
+#ifndef TEXTURES_SPEEDHACK
+	tex->last_frame = OBJ_NOT_USED;
+#endif
+#ifdef HAVE_TEX_CACHE
+	mark_as_cacheable(tex)
+#endif
+}
+
 void vglOverloadTexDataPointer(GLenum target, void *data) {
 	THREAD_SAFE()
 
@@ -2686,6 +2794,28 @@ void vglOverloadTexDataPointer(GLenum target, void *data) {
 	case GL_TEXTURE_1D:
 #endif
 		tex->data = data;
+		break;
+	default:
+		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, target)
+	}
+}
+
+void vglOverloadTexPaletteDataPointer(GLenum target, void *data) {
+	THREAD_SAFE()
+
+	// Aliasing texture unit for cleaner code
+	texture_unit *tex_unit = &texture_units[server_texture_unit];
+	int texture2d_idx;
+	resolve_tex_target(target, SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, target));
+	texture *tex = &texture_slots[texture2d_idx];
+
+	switch (target) {
+	case GL_TEXTURE_CUBE_MAP:
+	case GL_TEXTURE_2D:
+#ifdef HAVE_UNPURE_TEXFORMATS
+	case GL_TEXTURE_1D:
+#endif
+		tex->palette_data = data;
 		break;
 	default:
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, target)

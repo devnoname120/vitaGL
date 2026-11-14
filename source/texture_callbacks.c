@@ -95,6 +95,17 @@ uint32_t read_rgba4444(const void *data) {
 	return ((a << 24) | (b << 16) | (g << 8) | r);
 }
 
+// Read callback for 16bpp unsigned BGRA4444 format
+uint32_t read_bgra4444(const void *data) {
+	const uint16_t clr = *(uint16_t *)data;
+	uint8_t r, g, b, a;
+	b = convert_u16_to_u32_cspace(clr, 0, 12, 0x0F);
+	g = convert_u16_to_u32_cspace(clr, 4, 12, 0x0F);
+	r = convert_u16_to_u32_cspace(clr, 8, 12, 0x0F);
+	a = convert_u16_to_u32_cspace(clr, 12, 12, 0x0F);
+	return ((a << 24) | (b << 16) | (g << 8) | r);
+}
+
 // Read callback for 16bpp unsigned RGB565 format
 uint32_t read_rgb565(const void *data) {
 	const uint16_t clr = *(uint16_t *)data;
@@ -144,12 +155,8 @@ uint32_t read_la88(const void *data) {
 
 // Write callback for 32bpp unsigned RGBA format
 void write_rgba8888(void *data, uint32_t color) {
-	uint8_t *dst = (uint8_t *)data;
-	const uint8_t *src = (uint8_t *)&color;
-	dst[0] = src[0];
-	dst[1] = src[1];
-	dst[2] = src[2];
-	dst[3] = src[3];
+	uint32_t *dst = (uint32_t *)data;
+	*dst = color;
 }
 
 // Write callback for 32bpp unsigned ABGR format

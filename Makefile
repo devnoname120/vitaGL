@@ -13,11 +13,15 @@ CC      = $(PREFIX)-gcc
 CXX     = $(PREFIX)-g++
 AR      = $(PREFIX)-gcc-ar
 CFLAGS  = -g -Wl,-q -O3 -ffast-math -mtune=cortex-a9 -mfpu=neon -Wno-incompatible-pointer-types -Wno-stringop-overflow -mfp16-format=ieee \
-	-DVGL_GIT_HASH='"$(shell git rev-parse --short HEAD)"'
+	-DVGL_GIT_HASH='"$(shell git rev-parse --short HEAD)"' -Isource
 ASFLAGS = $(CFLAGS)
 
 ifeq ($(SOFTFP_ABI),1)
 CFLAGS += -mfloat-abi=softfp -DHAVE_SOFTFP_ABI
+endif
+
+ifeq ($(HAVE_ACCURATE_MSAA),1)
+CFLAGS += -DHAVE_ACCURATE_MSAA
 endif
 
 ifeq ($(NO_DEBUG),1)
@@ -152,6 +156,10 @@ ifeq ($(HAVE_PROFILING),1)
 CFLAGS += -DHAVE_PROFILING
 endif
 
+ifeq ($(HAVE_VERTEX_LAYOUT_CACHE),1)
+CFLAGS += -DHAVE_VERTEX_LAYOUT_CACHE
+endif
+
 ifeq ($(LOG_ERRORS),2)
 CFLAGS += -DLOG_ERRORS -DFILE_LOG
 endif
@@ -222,6 +230,10 @@ endif
 
 ifeq ($(HAVE_TEXTURE_CACHE),1)
 CFLAGS += -DHAVE_TEX_CACHE
+endif
+
+ifeq ($(HAVE_FIXED_ATTRIBUTES),1)
+CFLAGS += -DHAVE_FIXED_ATTRIBUTES
 endif
 
 ifeq ($(DISABLE_FFP_MULTITEXTURE),1)

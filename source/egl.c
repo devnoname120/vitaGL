@@ -16,9 +16,6 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/*
- *
- */
 #include "shared.h"
 #include "vitaGL.h"
 
@@ -27,6 +24,7 @@
 
 // Default bogus values used for default objects
 enum {
+	EGL_NULL_CTX,
 	EGL_DEFAULT_CTX,
 	EGL_DEFAULT_SURF,
 	EGL_DEFAULT_DISP,

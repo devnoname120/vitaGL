@@ -152,6 +152,12 @@ GLboolean prim_is_non_native = GL_FALSE; // Flag for when a primitive not suppor
 		break; \
 	}
 
+static inline __attribute__((always_inline)) void convert_16_to_8bit_indices(uint16_t *restrict dst, const uint8_t *restrict src, int32_t count) {
+	for (int32_t i = 0; i < count; i++) {
+		dst[i] = src[i];
+	}
+}
+
 void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 	THREAD_SAFE()
 
@@ -357,10 +363,7 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
 	// sceGxm doesn't support 8bit indices natively, so we internally convert to 16bit
 	if (type == GL_UNSIGNED_BYTE) {
 		uint16_t *idx16 = gpu_alloc_mapped_temp(count * sizeof(uint16_t));
-		uint8_t *idx8 = (uint8_t *)src;
-		for (GLsizei i = 0; i < count; i++) {
-			idx16[i] = idx8[i];
-		}
+		convert_16_to_8bit_indices(idx16, (const uint8_t *)src, count);
 		src = idx16;
 	}
 	
@@ -567,7 +570,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
 	restore_polygon_mode(gxm_p);
 }
 
-void vglDrawObjects(GLenum mode, GLsizei count, GLboolean implicit_wvp) {
+void vglDrawObjects(GLenum mode, GLsizei count) {
 	THREAD_SAFE()
 
 #ifdef ENABLE_LEGACY_PIPELINE
@@ -585,11 +588,11 @@ void vglDrawObjects(GLenum mode, GLsizei count, GLboolean implicit_wvp) {
 
 	texture_unit *tex_unit = &texture_units[0];
 	if (cur_program != 0) {
-		_vglDrawObjects_CustomShadersIMPL(implicit_wvp);
+		_vglDrawObjects_CustomShadersIMPL();
 		sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, index_object, count);
-	} else if (ffp_vertex_attrib_state & (1 << 0)) {
+	} else if (ffp_vertex_attrib_state & (1 << FFP_ATTRIB_POSITION)) {
 		reload_ffp_shaders(NULL, NULL, SCE_GXM_INDEX_SOURCE_INDEX_16BIT);
-		if (ffp_vertex_attrib_state & (1 << 1)) {
+		if (ffp_vertex_attrib_state & (1 << FFP_ATTRIB_TEX0)) {
 			if (texture_slots[tex_unit->tex_id[0]].status != TEX_VALID)
 				return;
 #ifndef TEXTURES_SPEEDHACK
@@ -606,6 +609,8 @@ void vglDrawObjects(GLenum mode, GLsizei count, GLboolean implicit_wvp) {
 	}
 
 	restore_polygon_mode(gxm_p);
+#else
+	vgl_log("%s:%d %s: This function requires ENABLE_LEGACY_PIPELINE=1 flag.\n", __FILE__, __LINE__, __func__);
 #endif
 }
 

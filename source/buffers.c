@@ -38,6 +38,9 @@ void *index_object; // Index object address for vgl* draw pipeline
 
 static vao default_vao; // Vertex Array Object used when no vao is bound
 vao *cur_vao = &default_vao; // Current in-use vertex array object
+#if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
+uint32_t vertex_layout_cur_ver = 0;
+#endif
 
 query *active_query = NULL; // Active query object
 static query queries[MAX_QUERIES_NUM]; // Available query objects pool
@@ -45,6 +48,9 @@ uint32_t *queries_buffer = NULL; // Buffer used for visibility testing
 SceGxmNotification query_fence; // Fence used for occlusion queries sync
 
 void reset_vao(vao *v) {
+#if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
+	v->vertex_layout_version = ++vertex_layout_cur_ver;
+#endif
 	vgl_memset(v->vertex_attrib_offsets, 0, sizeof(uint32_t) * VERTEX_ATTRIBS_NUM);
 	vgl_memset(v->vertex_attrib_vbo, 0, sizeof(uint32_t) * VERTEX_ATTRIBS_NUM);
 	for (int i = 0; i < VERTEX_ATTRIBS_NUM; i++) {
@@ -101,6 +107,8 @@ void glGenQueries(GLsizei n, GLuint *ids) {
 #ifndef SKIP_ERROR_HANDLING
 	if (n < 0) {
 		SET_GL_ERROR(GL_INVALID_VALUE)
+	} else if (n == 0) {
+		return;
 	}
 #endif
 	for (GLuint i = 0; i < MAX_QUERIES_NUM; i++) {
@@ -124,7 +132,8 @@ void glDeleteQueries(GLsizei n, const GLuint *ids) {
 	}
 #endif
 	for (GLuint i = 0; i < n; i++) {
-		queries[ids[i]].id = 0xFF;
+		query *q = (query*)ids[i];
+		q->id = 0xFF;
 	}
 }
 
@@ -166,6 +175,42 @@ void glEndQuery(GLenum target) {
 }
 
 void glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params) {
+	THREAD_SAFE()
+
+	query *q = (query *)id;
+
+	switch (pname) {
+	case GL_QUERY_RESULT:
+		if (q->sync > *query_fence.address) {
+			dirty_query = GL_TRUE;
+			scene_reset();
+			sceGxmNotificationWait(&query_fence);
+		}
+		*params = queries_buffer[q->id] + queries_buffer[q->id + MAX_QUERIES_NUM] + queries_buffer[q->id + MAX_QUERIES_NUM * 2] + queries_buffer[q->id + MAX_QUERIES_NUM * 3];
+		if (q->mode != GL_SAMPLES_PASSED) {
+			*params = *params > 0 ? GL_TRUE : GL_FALSE;
+		}
+		break;
+	case GL_QUERY_RESULT_NO_WAIT:
+		if (q->sync <= *query_fence.address) {
+			*params = queries_buffer[q->id] + queries_buffer[q->id + MAX_QUERIES_NUM] + queries_buffer[q->id + MAX_QUERIES_NUM * 2] + queries_buffer[q->id + MAX_QUERIES_NUM * 3];
+			if (q->mode != GL_SAMPLES_PASSED) {
+				*params = *params > 0 ? GL_TRUE : GL_FALSE;
+			}
+		}
+		break;
+	case GL_QUERY_RESULT_AVAILABLE:
+		*params = (q->sync <= *query_fence.address) ? GL_TRUE : GL_FALSE;
+		break;
+	case GL_QUERY_TARGET:
+		*params = q->mode;
+		break;
+	default:
+		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, pname)
+	}
+}
+
+void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params) {
 	THREAD_SAFE()
 
 	query *q = (query *)id;
@@ -272,11 +317,6 @@ void glCreateBuffers(GLsizei n, GLuint *buffers) {
 void glBindBuffer(GLenum target, GLuint buffer) {
 	THREAD_SAFE()
 
-#ifdef HAVE_DLISTS
-	// Enqueueing function to a display list if one is being compiled
-	if (_vgl_enqueue_list_func(glBindBuffer, DLIST_FUNC_U32_U32, target, buffer))
-		return;
-#endif
 	switch (target) {
 	case GL_ARRAY_BUFFER:
 		vertex_array_unit = buffer;
@@ -313,6 +353,17 @@ void glDeleteBuffers(GLsizei n, const GLuint *gl_buffers) {
 				} else {
 					vgl_free(gpu_buf->ptr);
 				}
+				if ((vbo *)vertex_array_unit == gpu_buf) {
+					vertex_array_unit = 0;
+				}
+				if ((vbo *)uniform_array_unit == gpu_buf) {
+					uniform_array_unit = 0;
+				}
+				if ((vbo *)cur_vao->index_array_unit == gpu_buf) {
+					cur_vao->index_array_unit = 0;
+				}
+				// Setting back to NULL just to prevent double free crashes
+				gpu_buf->ptr = NULL;
 			}
 			vgl_free(gpu_buf);
 		}
@@ -693,8 +744,8 @@ void vglVertexPointer(GLint size, GLenum type, GLsizei stride, GLuint count, con
 		SET_GL_ERROR(GL_INVALID_VALUE)
 	}
 #endif
-	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[0];
-	SceGxmVertexStream *streams = &ffp_vertex_stream_config[0];
+	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[FFP_ATTRIB_POSITION];
+	SceGxmVertexStream *streams = &ffp_vertex_stream_config[FFP_ATTRIB_POSITION];
 
 	unsigned short bpe;
 	switch (type) {
@@ -725,8 +776,8 @@ void vglColorPointer(GLint size, GLenum type, GLsizei stride, GLuint count, cons
 		SET_GL_ERROR(GL_INVALID_VALUE)
 	}
 #endif
-	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[2];
-	SceGxmVertexStream *streams = &ffp_vertex_stream_config[2];
+	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[FFP_ATTRIB_COLOR];
+	SceGxmVertexStream *streams = &ffp_vertex_stream_config[FFP_ATTRIB_COLOR];
 
 	unsigned short bpe;
 	switch (type) {
@@ -769,8 +820,8 @@ void vglTexCoordPointer(GLint size, GLenum type, GLsizei stride, GLuint count, c
 		SET_GL_ERROR(GL_INVALID_VALUE)
 	}
 #endif
-	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[1];
-	SceGxmVertexStream *streams = &ffp_vertex_stream_config[1];
+	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[FFP_ATTRIB_TEX0];
+	SceGxmVertexStream *streams = &ffp_vertex_stream_config[FFP_ATTRIB_TEX0];
 
 	unsigned short bpe;
 	switch (type) {
@@ -827,8 +878,8 @@ void vglIndexPointer(GLenum type, GLsizei stride, GLuint count, const GLvoid *po
 void vglVertexPointerMapped(GLint size, const GLvoid *pointer) {
 	THREAD_SAFE()
 
-	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[0];
-	SceGxmVertexStream *streams = &ffp_vertex_stream_config[0];
+	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[FFP_ATTRIB_POSITION];
+	SceGxmVertexStream *streams = &ffp_vertex_stream_config[FFP_ATTRIB_POSITION];
 
 	attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
 	attributes->componentCount = size;
@@ -840,8 +891,8 @@ void vglVertexPointerMapped(GLint size, const GLvoid *pointer) {
 void vglColorPointerMapped(GLenum type, const GLvoid *pointer) {
 	THREAD_SAFE()
 
-	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[2];
-	SceGxmVertexStream *streams = &ffp_vertex_stream_config[2];
+	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[FFP_ATTRIB_COLOR];
+	SceGxmVertexStream *streams = &ffp_vertex_stream_config[FFP_ATTRIB_COLOR];
 
 	unsigned short bpe;
 	switch (type) {
@@ -878,8 +929,8 @@ void vglColorPointerMapped(GLenum type, const GLvoid *pointer) {
 void vglTexCoordPointerMapped(const GLvoid *pointer) {
 	THREAD_SAFE()
 
-	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[1];
-	SceGxmVertexStream *streams = &ffp_vertex_stream_config[1];
+	SceGxmVertexAttribute *attributes = &ffp_vertex_attrib_config[FFP_ATTRIB_TEX0];
+	SceGxmVertexStream *streams = &ffp_vertex_stream_config[FFP_ATTRIB_TEX0];
 
 	attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
 	attributes->componentCount = 2;

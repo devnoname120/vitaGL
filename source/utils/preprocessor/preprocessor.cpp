@@ -16,6 +16,8 @@
 #include "const.h"
 #include "expression.h"
 
+#include <vitaGL.h>
+
 using namespace std;
 
 namespace preprocessor
@@ -2134,14 +2136,21 @@ string preprocess(string mode, string infile, string outfile, list<string> defin
 }
 }
 
+static std::string out;
+
 extern "C" {
-void glsl_preprocess(char *mode, const char *infile, char *output) {
+char *glsl_preprocessor_run(char *mode, const char *infile) {
 	std::list<std::string> dummy;
 	std::list<std::string> defines;
 	defines.push_back("#define GL_ES 1");
 	defines.push_back("#define VITAGL");
 	std::map<std::string, std::string> hasCppAttributeMap;
-	std::string out = preprocessor::preprocess(mode, infile, "", defines, dummy, dummy, dummy, hasCppAttributeMap, false);
-	strcpy(output, out.c_str());
+	out = preprocessor::preprocess(mode, infile, "", defines, dummy, dummy, dummy, hasCppAttributeMap, false);
+	return (char *)out.c_str();
+}
+
+void glsl_preprocessor_clean() {
+	out.clear();
+	out.shrink_to_fit();
 }
 }

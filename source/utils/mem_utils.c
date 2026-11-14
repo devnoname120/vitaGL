@@ -23,20 +23,16 @@
 
 #include "../shared.h"
 
-#define HEAP_COOKIE 0x13371337
-
 GLboolean has_cached_mem = GL_FALSE; // Flag for whether to use cached memory for mempools or not
 
 #ifndef HAVE_CUSTOM_HEAP
-static void *mempool_mspace[VGL_MEM_ALL] = {NULL, NULL, NULL, NULL, NULL}; // mspace creations (VRAM, RAM, PHYCONT RAM, CDLG, EXTERNAL)
+static void *mempool_mspace[VGL_MEM_ALL - 1] = {}; // sceClibMspace heaps
 #endif
-static void *mempool_addr[VGL_MEM_ALL] = {NULL, NULL, NULL, NULL, NULL}; // addresses of heap memblocks (VRAM, RAM, PHYCONT RAM, CDLG, EXTERNAL)
-static SceUID mempool_id[VGL_MEM_ALL] = {0, 0, 0, 0, 0}; // UIDs of heap memblocks (VRAM, RAM, PHYCONT RAM, EXTERNAL)
-static size_t mempool_size[VGL_MEM_ALL] = {0, 0, 0, 0, 0}; // sizes of heap memlbocks (VRAM, RAM, PHYCONT RAM, EXTERNAL)
+static void *mempool_addr[VGL_MEM_ALL] = {}; // Base addresses of heap memblocks
+static void *mempool_end[VGL_MEM_ALL] = {}; // Addresses of heap memblocks ends
+static size_t mempool_size[VGL_MEM_ALL] = {}; // Sizes (in bytes) of heap memblocks
 
 GLboolean vgl_has_cdlg_support = GL_TRUE;
-
-static int mempool_initialized = GL_FALSE;
 
 #ifdef HAVE_WRAPPED_ALLOCATORS
 void *__real_calloc(uint32_t nmember, uint32_t size);
@@ -47,85 +43,154 @@ void *__real_realloc(void *ptr, uint32_t size);
 #endif
 
 #ifdef HAVE_CUSTOM_HEAP
-typedef struct tm_block_s {
-	struct tm_block_s *next; // next block in list (either free or allocated)
-	int32_t type; // one of vglMemType
-	uintptr_t base; // block start address
-	uint32_t offset; // offset for USSE stuff (unused)
-	uint32_t size; // block size
-#ifndef SKIP_ERROR_HANDLING
-	uint32_t real_size; // real alloc size for putting a heap cookie
+
+// Lightweighted mutexes for thread-safeness
+#ifndef HAVE_SINGLE_THREADED_GC
+static SceKernelLwMutexWork tm_mutexes[VGL_MEM_ALL - 1] = {};
+static SceKernelLwMutexWork header_mutex;
+#define tm_lock_mutex(mtx) sceKernelLockLwMutex(mtx, 1, NULL);
+#define tm_unlock_mutex(mtx) sceKernelUnlockLwMutex(mtx, 1);
+#else
+#define tm_lock_mutex(mtx)
+#define tm_unlock_mutex(mtx)
 #endif
+
+// Minimum size in bytes for a block (header + footer)
+#define MIN_FREE_BLOCK_SIZE (8)
+
+// Memblock header
+typedef struct tm_block_s {
+	struct tm_block_s *next;
+	struct tm_block_s *prev;
+	uintptr_t base;
+	uint32_t size;
+	vglMemType type;
+	GLboolean used;
 } tm_block_t;
 
-static tm_block_t *tm_alloclist; // list of allocated blocks
-static tm_block_t *tm_freelist; // list of free blocks
+static tm_block_t *tm_alloclist[VGL_MEM_ALL - 1] = {}; // Lists of allocated blocks
+static tm_block_t *tm_freelist[VGL_MEM_ALL - 1] = {}; // Lists of available free blocks
+static uint32_t tm_free[VGL_MEM_ALL - 1] = {}; // Amount of raw free memory per heap type
+static uint32_t tm_max_failed_alloc[VGL_MEM_ALL - 1] = {}; // Last requested allocation size in bytes that failed
 
-static uint32_t tm_free[VGL_MEM_ALL]; // see enum vglMemType
+#define HEADERS_PER_CHUNK (8192) // Number of headers to alloc per chunk when headers list is exhausted
+static tm_block_t *tm_free_headers = NULL; // Available memblock headers list
 
-// get new block header
-static inline tm_block_t *heap_blk_new(void) {
-	return calloc(1, sizeof(tm_block_t));
+/*
+ * Get a new memblock header for an allocation.
+ * Here we use malloc-ed pointers rather than appending the actual header on the block itself
+ * so that these headers are fast to access by the CPU (since vitaGL uses uncached memory by default.
+ */
+static tm_block_t *heap_blk_new(void) {
+	tm_lock_mutex(&header_mutex)
+	if (!tm_free_headers) {
+		vgl_log("Extending heap headers list with an extra chunk.\n");
+#ifdef HAVE_WRAPPED_ALLOCATORS
+		tm_block_t *chunk = __real_malloc(sizeof(tm_block_t) * HEADERS_PER_CHUNK);
+#else
+		tm_block_t *chunk = malloc(sizeof(tm_block_t) * HEADERS_PER_CHUNK);
+#endif
+		
+#ifndef SKIP_ERROR_HANDLING
+		if (!chunk) {
+			vgl_log("%s:%d Out of memory: cannot allocate new headers for memory blocks!\n", __FILE__, __LINE__);	
+			tm_unlock_mutex(&header_mutex)
+			return NULL;
+		}
+#endif
+		for (int i = 0; i < HEADERS_PER_CHUNK - 1; i++) {
+			chunk[i].next = &chunk[i + 1];
+		}
+		chunk[HEADERS_PER_CHUNK - 1].next = NULL;
+		tm_free_headers = &chunk[0];
+	}
+	tm_block_t *h = tm_free_headers;
+	tm_free_headers = h->next;
+	tm_unlock_mutex(&header_mutex)
+	
+	vgl_memset(h, 0, sizeof(tm_block_t));
+	return h;
 }
 
-// release block header
-static inline void heap_blk_release(tm_block_t *block) {
-	free(block);
+// Release a memblock header
+static inline __attribute__((always_inline)) void heap_blk_release(tm_block_t *block) {
+	tm_lock_mutex(&header_mutex)
+	block->next = tm_free_headers;
+	tm_free_headers = block;
+	tm_unlock_mutex(&header_mutex)
 }
 
-// determine if two blocks can be merged into one
-// blocks of different types can't be merged,
-// blocks of same type can only be merged if they're next to each other
-// in memory and have matching offsets
-static inline int heap_blk_mergeable(tm_block_t *a, tm_block_t *b) {
-	return a->type == b->type
-		&& a->base + a->size == b->base
-		&& a->offset + a->size == b->offset;
-}
-
-// inserts a block into the free list and merges with neighboring
-// free blocks if possible
+// Insert a new block in the free blocks list
 static void heap_blk_insert_free(tm_block_t *block) {
-	tm_block_t *curblk = tm_freelist;
-	tm_block_t *prevblk = NULL;
-	while (curblk && curblk->base < block->base) {
-		prevblk = curblk;
-		curblk = curblk->next;
+	block->used = GL_FALSE;
+	uint32_t incoming_size = block->size;
+
+	*(tm_block_t **)block->base = block;
+	*(tm_block_t **)(block->base + block->size - 4) = block;
+	
+	uintptr_t right_addr = block->base + block->size;
+	if (right_addr < (uintptr_t)mempool_end[block->type]) {
+		tm_block_t *right = *(tm_block_t **)right_addr;
+		if (right->used == GL_FALSE) {
+			if (right->prev)
+				right->prev->next = right->next;
+			else
+				tm_freelist[block->type] = right->next;
+			if (right->next)
+				right->next->prev = right->prev;
+
+			block->size += right->size;
+			*(tm_block_t **)(block->base + block->size - 4) = block;
+			heap_blk_release(right);
+		}
 	}
 
-	if (prevblk)
-		prevblk->next = block;
-	else
-		tm_freelist = block;
+	uintptr_t left_footer_addr = block->base - 4;
+	if (left_footer_addr >= (uintptr_t)mempool_addr[block->type]) {
+		tm_block_t *left = *(tm_block_t **)left_footer_addr;
+		if (left->used == GL_FALSE) {
+			if (left->prev)
+				left->prev->next = left->next;
+			else
+				tm_freelist[block->type] = left->next;
+			if (left->next)
+				left->next->prev = left->prev;
 
-	block->next = curblk;
-	tm_free[block->type] += block->size;
-
-	if (curblk && heap_blk_mergeable(block, curblk)) {
-		block->size += curblk->size;
-		block->next = curblk->next;
-		heap_blk_release(curblk);
+			left->size += block->size;
+			*(tm_block_t **)(left->base + left->size - 4) = left;
+			heap_blk_release(block);
+			block = left;
+		}
 	}
 
-	if (prevblk && heap_blk_mergeable(prevblk, block)) {
-		prevblk->size += block->size;
-		prevblk->next = block->next;
-		heap_blk_release(block);
-	}
+	tm_free[block->type] += incoming_size;
+
+	block->prev = NULL;
+	block->next = tm_freelist[block->type];
+	if (tm_freelist[block->type])
+		tm_freelist[block->type]->prev = block;
+	tm_freelist[block->type] = block;
 }
 
-// allocates a block from the heap
-// (removes it from free list and adds to alloc list)
+// Allocs a new block and returns it
 static tm_block_t *heap_blk_alloc(int32_t type, uint32_t size, uint32_t alignment) {
-	tm_block_t *curblk = tm_freelist;
+	tm_block_t *curblk = tm_freelist[type];
 	tm_block_t *prevblk = NULL;
 
 	while (curblk) {
-		const uint32_t skip = VGL_ALIGN(curblk->base, alignment) - curblk->base;
+		uint32_t skip = VGL_ALIGN(curblk->base + 4, alignment) - 4 - curblk->base;
+		if (skip != 0) {
+			while (skip < MIN_FREE_BLOCK_SIZE) {
+				skip += alignment;
+			}
+		}
 
-		if (curblk->type == type && skip + size <= curblk->size) {
+		if (skip + size <= curblk->size) {
 			tm_block_t *skipblk = NULL;
 			tm_block_t *unusedblk = NULL;
+
+			uint32_t remaining = curblk->size - skip - size;
+			GLboolean has_extra_block = remaining >= MIN_FREE_BLOCK_SIZE;
 
 			if (skip != 0) {
 				skipblk = heap_blk_new();
@@ -133,7 +198,7 @@ static tm_block_t *heap_blk_alloc(int32_t type, uint32_t size, uint32_t alignmen
 					return NULL;
 			}
 
-			if (skip + size != curblk->size) {
+			if (has_extra_block) {
 				unusedblk = heap_blk_new();
 				if (!unusedblk) {
 					if (skipblk)
@@ -142,46 +207,45 @@ static tm_block_t *heap_blk_alloc(int32_t type, uint32_t size, uint32_t alignmen
 				}
 			}
 
-			if (skip != 0) {
-				if (prevblk)
-					prevblk->next = skipblk;
-				else
-					tm_freelist = skipblk;
-
-				skipblk->next = curblk;
-				skipblk->type = curblk->type;
-				skipblk->base = curblk->base;
-				skipblk->offset = curblk->offset;
-				skipblk->size = skip;
-
-				curblk->base += skip;
-				curblk->offset += skip;
-				curblk->size -= skip;
-
-				prevblk = skipblk;
-			}
-
-			if (size != curblk->size) {
-				unusedblk->next = curblk->next;
-				curblk->next = unusedblk;
-				unusedblk->type = curblk->type;
-				unusedblk->base = curblk->base + size;
-				unusedblk->offset = curblk->offset + size;
-				unusedblk->size = curblk->size - size;
-				curblk->size = size;
-			}
-
 			if (prevblk)
 				prevblk->next = curblk->next;
 			else
-				tm_freelist = curblk->next;
+				tm_freelist[type] = curblk->next;
+			if (curblk->next)
+				curblk->next->prev = prevblk;
+			tm_free[type] -= curblk->size;
 
-			curblk->next = tm_alloclist;
-#ifndef SKIP_ERROR_HANDLING
-			curblk->real_size = size;
-#endif
-			tm_alloclist = curblk;
-			tm_free[type] -= size;
+			if (skip != 0) {
+				skipblk->type = curblk->type;
+				skipblk->base = curblk->base;
+				skipblk->size = skip;
+
+				curblk->base += skip;
+				curblk->size -= skip;
+			}
+
+			if (has_extra_block) {
+				unusedblk->type = curblk->type;
+				unusedblk->base = curblk->base + size;
+				unusedblk->size = remaining;
+				curblk->size = size;
+			}
+
+			curblk->used = GL_TRUE;
+			*(tm_block_t **)curblk->base = curblk;
+			*(tm_block_t **)(curblk->base + curblk->size - 4) = curblk;
+			curblk->prev = NULL;
+			curblk->next = tm_alloclist[type];
+			if (tm_alloclist[type])
+				tm_alloclist[type]->prev = curblk;
+			tm_alloclist[type] = curblk;
+
+			if (skip != 0)
+				heap_blk_insert_free(skipblk);
+
+			if (has_extra_block)
+				heap_blk_insert_free(unusedblk);
+
 			return curblk;
 		}
 
@@ -192,93 +256,145 @@ static tm_block_t *heap_blk_alloc(int32_t type, uint32_t size, uint32_t alignmen
 	return NULL;
 }
 
-// frees a previously allocated heap block
-// (removes from alloc list and inserts into free list)
-static void heap_blk_free(uintptr_t base) {
-	tm_block_t *curblk = tm_alloclist;
-	tm_block_t *prevblk = NULL;
+// Frees a previously allocated block
+static void heap_blk_free(uintptr_t base, vglMemType type) {
+	tm_block_t **slot = (tm_block_t **)(base - 4);
+	tm_block_t *block = *slot;
+	
+	tm_lock_mutex(&tm_mutexes[type])
 
-	while (curblk && curblk->base != base) {
-		prevblk = curblk;
-		curblk = curblk->next;
-	}
-
-	if (!curblk) {
 #ifndef SKIP_ERROR_HANDLING
-		vgl_log("%s:%d An internal free failed (possible double free call) on pointer: 0x%08X!\n", __FILE__, __LINE__, base);
-#endif
+	if (!block || block->base + 4 != base) {
+		tm_unlock_mutex(&tm_mutexes[type])
+		vgl_log("%s:%d A heap overflow or double free was detected on pointer: 0x%08X!\n", __FILE__, __LINE__, base);
 		return;
 	}
-
-#ifndef SKIP_ERROR_HANDLING
-	if (*(uint32_t *)(curblk->base + curblk->real_size - 4) != HEAP_COOKIE) {
-		vgl_log("%s:%d A heap overflow was detected on pointer: 0x%08X!\n", __FILE__, __LINE__, base);
-	}
 #endif
-
-	if (prevblk)
-		prevblk->next = curblk->next;
+	*slot = NULL;
+	
+	if (block->prev)
+		block->prev->next = block->next;
 	else
-		tm_alloclist = curblk->next;
+		tm_alloclist[type] = block->next;
+	if (block->next)
+		block->next->prev = block->prev;
 
-	curblk->next = NULL;
+	block->next = NULL;
+	block->prev = NULL;
 
-	heap_blk_insert_free(curblk);
+	heap_blk_insert_free(block);
+	tm_unlock_mutex(&tm_mutexes[type])
 }
 
-// initializes heap variables and blockpool
+// Initializes heap setup
 static void heap_init(void) {
-	tm_alloclist = NULL;
-	tm_freelist = NULL;
-
-	for (int i = 0; i < VGL_MEM_ALL; i++)
+	for (int i = 0; i < VGL_MEM_ALL - 1; i++) {
+		tm_alloclist[i] = NULL;
+		tm_freelist[i] = NULL;
 		tm_free[i] = 0;
-}
-
-// resets heap state and frees allocated block headers
-static void heap_destroy(void) {
-	tm_block_t *n;
-
-	tm_block_t *p = tm_alloclist;
-	while (p) {
-		n = p->next;
-		heap_blk_release(p);
-		p = n;
-	}
-
-	p = tm_freelist;
-	while (p) {
-		n = p->next;
-		heap_blk_release(p);
-		p = n;
 	}
 }
 
-// adds a memblock to the heap
+// Extends the heap setup with a new heap type
 static void heap_extend(int32_t type, void *base, uint32_t size) {
+	tm_max_failed_alloc[type] = size + 1;
 	tm_block_t *block = heap_blk_new();
 	block->next = NULL;
 	block->type = type;
 	block->base = (uintptr_t)base;
-	block->offset = 0;
 	block->size = size;
 	heap_blk_insert_free(block);
 }
 
-// allocates memory from the heap (basically malloc())
+// Allocates memory from the requested heap type
 static void *heap_alloc(int32_t type, uint32_t size, uint32_t alignment) {
-#ifndef SKIP_ERROR_HANDLING
-	size += 4;
-#endif
-	tm_block_t *block = heap_blk_alloc(type, size, alignment);
-
-	if (!block)
+	tm_lock_mutex(&tm_mutexes[type])
+	tm_block_t *block = heap_blk_alloc(type, size + MIN_FREE_BLOCK_SIZE, alignment);
+	tm_unlock_mutex(&tm_mutexes[type])
+	if (!block) {
+		tm_max_failed_alloc[type] = size;
 		return NULL;
+	}
 
+	return (void *)(block->base + 4);
+}
+
+// Attempt to extend an allocated block with nearby unused blocks
+static GLboolean heap_blk_try_extend(vglMemType type, tm_block_t *block, uint32_t new_size) {
+	uintptr_t target_base = block->base + block->size;
+	if (target_base >= (uintptr_t)mempool_end[type])
+		return GL_FALSE;
+
+	tm_block_t *curblk = *(tm_block_t **)target_base;
+	if (curblk->used == GL_TRUE)
+		return GL_FALSE;
+
+	uint32_t available = block->size + curblk->size;
+	if (available < new_size)
+		return GL_FALSE;
+
+	uint32_t needed_from_free = new_size - block->size;
+	if (curblk->prev)
+		curblk->prev->next = curblk->next;
+	else
+		tm_freelist[type] = curblk->next;
+	if (curblk->next)
+		curblk->next->prev = curblk->prev;
+
+	if (needed_from_free == curblk->size) {
+		tm_free[type] -= curblk->size;
+		heap_blk_release(curblk);
+	} else {
+		curblk->base += needed_from_free;
+		curblk->size -= needed_from_free;
+		tm_free[type] -= needed_from_free;
+		*(tm_block_t **)curblk->base = curblk;
+		curblk->prev = NULL;
+		curblk->next = tm_freelist[type];
+		if (tm_freelist[type])
+			tm_freelist[type]->prev = curblk;
+		tm_freelist[type] = curblk;
+	}
+	
+	block->size = new_size;
+	*(tm_block_t **)(block->base + block->size - 4) = block;
+
+	return GL_TRUE;
+}
+
+// realloc equivalent for heap
+static void *heap_realloc(vglMemType type, void *ptr, uint32_t size) {
+	// Check for memory corruption
+	uint32_t real_size = size + MIN_FREE_BLOCK_SIZE;
+	tm_block_t **slot = (tm_block_t **)((uintptr_t)ptr - 4);
+	tm_block_t *block = *slot;
 #ifndef SKIP_ERROR_HANDLING
-	*(uint32_t *)(block->base + block->real_size - 4) = HEAP_COOKIE;
+	if (!block || block->base + 4 != (uintptr_t)ptr) {
+		vgl_log("%s:%d Corrupted block during realloc: 0x%08X!\n", __FILE__, __LINE__, (uintptr_t)ptr);
+		return NULL;
+	}
 #endif
-	return (void *)block->base;
+
+	// If the block size is big enough to contain the new size, just return the block itself
+	if (real_size <= block->size) {
+		return ptr;
+	}
+
+	// Attempt to merge nearby blocks to fullfill the request
+	tm_lock_mutex(&tm_mutexes[type]);
+	int extended = heap_blk_try_extend(type, block, real_size);
+	tm_unlock_mutex(&tm_mutexes[type]);
+	if (extended) {
+		return ptr;
+	}
+
+	// Everything failed, so alloc a new block of the requested size and move data on it
+	void *newptr = heap_alloc(type, size, MEM_ALIGNMENT);
+	if (newptr) {
+		vgl_fast_memcpy(newptr, ptr, block->size - 4);
+		heap_blk_free((uintptr_t)ptr, type);
+	}
+	return newptr;
 }
 #endif
 
@@ -298,33 +414,8 @@ void *vgl_alloc_phycont_block(uint32_t size) {
 }
 #endif
 
-void vgl_mem_term(void) {
-	if (!mempool_initialized)
-		return;
-
-#ifdef HAVE_CUSTOM_HEAP
-	heap_destroy();
-#endif
-
-	for (int i = 0; i < VGL_MEM_EXTERNAL; i++) {
-#ifndef HAVE_CUSTOM_HEAP
-		sceClibMspaceDestroy(mempool_mspace[i]);
-		mempool_mspace[i] = NULL;
-#endif
-		sceKernelFreeMemBlock(mempool_id[i]);
-		mempool_addr[i] = NULL;
-		mempool_id[i] = 0;
-		mempool_size[i] = 0;
-	}
-
-	mempool_initialized = 0;
-}
-
 void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_t size_cdlg) {
 	vgl_has_cdlg_support = GL_TRUE;
-	
-	if (mempool_initialized)
-		vgl_mem_term();
 
 	if (!has_cached_mem && size_ram > 0xC800000) // Vita has a smaller address mapping for uncached mem
 		size_ram = 0xC800000;
@@ -332,34 +423,66 @@ void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_
 	mempool_size[VGL_MEM_VRAM] = VGL_ALIGN(size_cdram, 256 * 1024);
 	mempool_size[VGL_MEM_RAM] = VGL_ALIGN(size_ram, 4 * 1024);
 #ifdef PHYCONT_ON_DEMAND
-	mempool_size[VGL_MEM_SLOW] = 0;
+	mempool_size[VGL_MEM_PHYCONT] = 0;
 #else
-	mempool_size[VGL_MEM_SLOW] = VGL_ALIGN(size_phycont, 1024 * 1024);
+	mempool_size[VGL_MEM_PHYCONT] = VGL_ALIGN(size_phycont, 1024 * 1024);
 #endif
 	mempool_size[VGL_MEM_BUDGET] = VGL_ALIGN(size_cdlg, 4 * 1024);
 
 #ifdef HAVE_CUSTOM_HEAP
 	// Initialize heap
+#ifndef HAVE_SINGLE_THREADED_GC
+	sceKernelCreateLwMutex(&header_mutex, "header mutex alloc", 0, 0, NULL);
+#endif
 	heap_init();
 #endif
 
-	if (mempool_size[VGL_MEM_VRAM])
+	SceUID mempool_id[VGL_MEM_ALL - 1] = {}; // UIDs of heap memblocks
+	if (mempool_size[VGL_MEM_VRAM]) {
 		mempool_id[VGL_MEM_VRAM] = sceKernelAllocMemBlock("cdram_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, mempool_size[VGL_MEM_VRAM], NULL);
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+		sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_VRAM], "cdram heap mutex", 0, 0, NULL);
+#endif
+	}
 	if (has_cached_mem) {
-		if (mempool_size[VGL_MEM_RAM])
+		if (mempool_size[VGL_MEM_RAM]) {
 			mempool_id[VGL_MEM_RAM] = sceKernelAllocMemBlock("ram_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, mempool_size[VGL_MEM_RAM], NULL);
-		if (mempool_size[VGL_MEM_SLOW])
-			mempool_id[VGL_MEM_SLOW] = sceKernelAllocMemBlock("phycont_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, mempool_size[VGL_MEM_SLOW], NULL);
-		if (mempool_size[VGL_MEM_BUDGET])
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_RAM], "ram heap mutex", 0, 0, NULL);
+#endif
+		}
+		if (mempool_size[VGL_MEM_PHYCONT]) {
+			mempool_id[VGL_MEM_PHYCONT] = sceKernelAllocMemBlock("phycont_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, mempool_size[VGL_MEM_PHYCONT], NULL);
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_PHYCONT], "phycont heap mutex", 0, 0, NULL);
+#endif
+		}
+		if (mempool_size[VGL_MEM_BUDGET]) {
 			mempool_id[VGL_MEM_BUDGET] = sceKernelAllocMemBlock("cdlg_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_CDIALOG_RW, mempool_size[VGL_MEM_BUDGET], NULL);
+			vgl_has_cdlg_support = GL_FALSE;
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_BUDGET], "cdlg heap mutex", 0, 0, NULL);
+#endif
+		}
 	} else {
-		if (mempool_size[VGL_MEM_RAM])
+		if (mempool_size[VGL_MEM_RAM]) {
 			mempool_id[VGL_MEM_RAM] = sceKernelAllocMemBlock("ram_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, mempool_size[VGL_MEM_RAM], NULL);
-		if (mempool_size[VGL_MEM_SLOW])
-			mempool_id[VGL_MEM_SLOW] = sceKernelAllocMemBlock("phycont_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, mempool_size[VGL_MEM_SLOW], NULL);
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_RAM], "ram heap mutex", 0, 0, NULL);
+#endif
+		}
+		if (mempool_size[VGL_MEM_PHYCONT]) {
+			mempool_id[VGL_MEM_PHYCONT] = sceKernelAllocMemBlock("phycont_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, mempool_size[VGL_MEM_PHYCONT], NULL);
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_PHYCONT], "phycont heap mutex", 0, 0, NULL);
+#endif
+		}
 		if (mempool_size[VGL_MEM_BUDGET]) {
 			mempool_id[VGL_MEM_BUDGET] = sceKernelAllocMemBlock("cdlg_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_CDIALOG_NC_RW, mempool_size[VGL_MEM_BUDGET], NULL);
 			vgl_has_cdlg_support = GL_FALSE;
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_BUDGET], "cdlg heap mutex", 0, 0, NULL);
+#endif
 		}
 	}
 	for (int i = 0; i < VGL_MEM_EXTERNAL; i++) {
@@ -368,6 +491,7 @@ void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_
 			sceKernelGetMemBlockBase(mempool_id[i], &mempool_addr[i]);
 
 			if (mempool_addr[i]) {
+				mempool_end[i] = (void *)((uintptr_t)mempool_addr[i] + mempool_size[i]);
 				sceGxmMapMemory(mempool_addr[i], mempool_size[i], SCE_GXM_MEMORY_ATTRIB_RW);
 #ifndef HAVE_CUSTOM_HEAP
 				mempool_mspace[i] = sceClibMspaceCreate(mempool_addr[i], mempool_size[i]);
@@ -392,12 +516,18 @@ void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_
 		sceKernelGetFreeMemorySize(&info);
 		phycont_size = info.size_phycont;
 	}
-	mempool_size[VGL_MEM_SLOW] = phycont_size;
+	mempool_size[VGL_MEM_PHYCONT] = phycont_size;
 #endif
 
 	// Mapping newlib heap into sceGxm
+#ifdef HAVE_WRAPPED_ALLOCATORS
+	void *dummy = __real_malloc(1);
+	__real_free(dummy);
+#else
 	void *dummy = malloc(1);
 	free(dummy);
+#endif
+	
 
 	SceKernelMemBlockInfo info;
 	info.size = sizeof(SceKernelMemBlockInfo);
@@ -406,31 +536,61 @@ void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_
 
 	mempool_size[VGL_MEM_EXTERNAL] = info.mappedSize;
 	mempool_addr[VGL_MEM_EXTERNAL] = info.mappedBase;
-
-	mempool_initialized = 1;
+	mempool_end[VGL_MEM_EXTERNAL] = (void *)((uintptr_t)mempool_addr[VGL_MEM_EXTERNAL] + mempool_size[VGL_MEM_EXTERNAL]);
 }
 
-vglMemType vgl_mem_get_type_by_addr(void *addr) {
-#if !defined(PHYCONT_ON_DEMAND) && defined(HAVE_CUSTOM_HEAP)
-	if (addr >= mempool_addr[VGL_MEM_EXTERNAL] && (addr < mempool_addr[VGL_MEM_EXTERNAL] + mempool_size[VGL_MEM_EXTERNAL]))
-		return VGL_MEM_EXTERNAL;
-	return -1;
+#ifndef PHYCONT_ON_DEMAND
+void vgl_mem_provide_phycont(size_t size_phycont) {
+	if (mempool_size[VGL_MEM_PHYCONT])
+		return;
+
+	SceUID mempool_id;
+	mempool_size[VGL_MEM_PHYCONT] = VGL_ALIGN(size_phycont, 1024 * 1024);
+	if (has_cached_mem) {
+		if (mempool_size[VGL_MEM_PHYCONT]) {
+			mempool_id = sceKernelAllocMemBlock("phycont_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, mempool_size[VGL_MEM_PHYCONT], NULL);
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_PHYCONT], "phycont heap mutex", 0, 0, NULL);
+#endif
+		}
+	} else {
+		if (mempool_size[VGL_MEM_PHYCONT]) {
+			mempool_id = sceKernelAllocMemBlock("phycont_mempool", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, mempool_size[VGL_MEM_PHYCONT], NULL);
+#if defined(HAVE_CUSTOM_HEAP) && !defined(HAVE_SINGLE_THREADED_GC)
+			sceKernelCreateLwMutex(&tm_mutexes[VGL_MEM_PHYCONT], "phycont heap mutex", 0, 0, NULL);
+#endif
+		}
+	}
+	
+	mempool_addr[VGL_MEM_PHYCONT] = NULL;
+	sceKernelGetMemBlockBase(mempool_id, &mempool_addr[VGL_MEM_PHYCONT]);
+	if (mempool_addr[VGL_MEM_PHYCONT]) {
+		mempool_end[VGL_MEM_PHYCONT] = (void *)((uintptr_t)mempool_addr[VGL_MEM_PHYCONT] + mempool_size[VGL_MEM_PHYCONT]);
+		sceGxmMapMemory(mempool_addr[VGL_MEM_PHYCONT], mempool_size[VGL_MEM_PHYCONT], SCE_GXM_MEMORY_ATTRIB_RW);
+#ifndef HAVE_CUSTOM_HEAP
+		mempool_mspace[VGL_MEM_PHYCONT] = sceClibMspaceCreate(mempool_addr[VGL_MEM_PHYCONT], mempool_size[VGL_MEM_PHYCONT]);
 #else
-	if (addr >= mempool_addr[VGL_MEM_VRAM] && (addr < (void *)((uint8_t *)mempool_addr[VGL_MEM_VRAM] + mempool_size[VGL_MEM_VRAM])))
+		heap_extend(VGL_MEM_PHYCONT, mempool_addr[VGL_MEM_PHYCONT], mempool_size[VGL_MEM_PHYCONT]);
+#endif
+	}
+}
+#endif
+
+vglMemType vgl_mem_get_type_by_addr(void *addr) {
+	if (addr >= mempool_addr[VGL_MEM_VRAM] && addr < mempool_end[VGL_MEM_VRAM])
 		return VGL_MEM_VRAM;
-	else if (addr >= mempool_addr[VGL_MEM_RAM] && (addr < (void *)((uint8_t *)mempool_addr[VGL_MEM_RAM] + mempool_size[VGL_MEM_RAM])))
+	else if (addr >= mempool_addr[VGL_MEM_RAM] && addr < mempool_end[VGL_MEM_RAM])
 		return VGL_MEM_RAM;
 #ifndef PHYCONT_ON_DEMAND
-	else if (addr >= mempool_addr[VGL_MEM_SLOW] && (addr < (void *)((uint8_t *)mempool_addr[VGL_MEM_SLOW] + mempool_size[VGL_MEM_SLOW])))
-		return VGL_MEM_SLOW;
+	else if (addr >= mempool_addr[VGL_MEM_PHYCONT] && addr < mempool_end[VGL_MEM_PHYCONT])
+		return VGL_MEM_PHYCONT;
 #endif
-	else if (addr >= mempool_addr[VGL_MEM_BUDGET] && (addr < (void *)((uint8_t *)mempool_addr[VGL_MEM_BUDGET] + mempool_size[VGL_MEM_BUDGET])))
+	else if (addr >= mempool_addr[VGL_MEM_BUDGET] && addr < mempool_end[VGL_MEM_BUDGET])
 		return VGL_MEM_BUDGET;
-	else if (addr >= mempool_addr[VGL_MEM_EXTERNAL] && (addr < (void *)((uint8_t *)mempool_addr[VGL_MEM_EXTERNAL] + mempool_size[VGL_MEM_EXTERNAL])))
+	else if (addr >= mempool_addr[VGL_MEM_EXTERNAL] && addr < mempool_end[VGL_MEM_EXTERNAL])
 		return VGL_MEM_EXTERNAL;
-#endif
 #ifdef PHYCONT_ON_DEMAND
-	return VGL_MEM_SLOW;
+	return VGL_MEM_PHYCONT;
 #else
 	return -1;
 #endif
@@ -439,8 +599,8 @@ vglMemType vgl_mem_get_type_by_addr(void *addr) {
 size_t vgl_mem_get_free_space(vglMemType type) {
 	if (type == VGL_MEM_EXTERNAL) {
 		return 0;
-#if defined(PHYCONT_ON_DEMAND)
-	} else if (type == VGL_MEM_SLOW) {
+#ifdef PHYCONT_ON_DEMAND
+	} else if (type == VGL_MEM_PHYCONT) {
 		if (system_app_mode) {
 			SceAppMgrBudgetInfo info;
 			info.size = sizeof(SceAppMgrBudgetInfo);
@@ -490,18 +650,26 @@ size_t vgl_malloc_usable_size(void *ptr) {
 	if (type == VGL_MEM_EXTERNAL)
 		return malloc_usable_size(ptr);
 #ifdef PHYCONT_ON_DEMAND
-	else if (type == VGL_MEM_SLOW) {
+	else if (type == VGL_MEM_PHYCONT) {
 		SceKernelMemBlockInfo info;
 		info.size = sizeof(SceKernelMemBlockInfo);
 		sceKernelGetMemBlockInfoByAddr(ptr, &info);
 		return info.mappedSize;
 	}
 #endif
-	else
-		return sceClibMspaceMallocUsableSize(ptr);
+#ifdef HAVE_CUSTOM_HEAP
+	tm_block_t **hdr = (tm_block_t **)((uintptr_t)ptr - 4);
+	tm_block_t *block = *hdr;
+	return block->size - MIN_FREE_BLOCK_SIZE;
+#else
+	return sceClibMspaceMallocUsableSize(ptr);
+#endif
 }
 
 void vgl_free(void *ptr) {
+	if (!ptr)
+		return;
+
 	vglMemType type = vgl_mem_get_type_by_addr(ptr);
 	if (type == VGL_MEM_EXTERNAL)
 #ifdef HAVE_WRAPPED_ALLOCATORS
@@ -510,14 +678,16 @@ void vgl_free(void *ptr) {
 		free(ptr);
 #endif
 #ifdef PHYCONT_ON_DEMAND
-	else if (type == VGL_MEM_SLOW) {
+	else if (type == VGL_MEM_PHYCONT) {
 		sceGxmUnmapMemory(ptr);
 		sceKernelFreeMemBlock(sceKernelFindMemBlockByAddr(ptr, 0));
 	}
 #endif
 #ifdef HAVE_CUSTOM_HEAP
-	else
-		heap_blk_free((uintptr_t)ptr);
+	else {
+		heap_blk_free((uintptr_t)ptr, type);
+		tm_max_failed_alloc[type] = tm_free[type] + 1;
+	}
 #else
 	else if (mempool_mspace[type])
 		sceClibMspaceFree(mempool_mspace[type], ptr);
@@ -532,11 +702,11 @@ void *vgl_malloc(size_t size, vglMemType type) {
 		return malloc(size);
 #endif
 #ifdef PHYCONT_ON_DEMAND
-	else if (type == VGL_MEM_SLOW)
+	else if (type == VGL_MEM_PHYCONT)
 		return vgl_alloc_phycont_block(size);
 #endif
 #ifdef HAVE_CUSTOM_HEAP
-	else if (size <= tm_free[type])
+	else if (size <= tm_max_failed_alloc[type])
 		return heap_alloc(type, size, MEM_ALIGNMENT);
 #else
 	else if (mempool_mspace[type])
@@ -553,7 +723,7 @@ void *vgl_calloc(size_t num, size_t size, vglMemType type) {
 		return calloc(num, size);
 #endif
 #ifdef PHYCONT_ON_DEMAND
-	else if (type == VGL_MEM_SLOW) {
+	else if (type == VGL_MEM_PHYCONT) {
 		void *ret = vgl_alloc_phycont_block(num * size);
 		if (ret) {
 			sceClibMemset(ret, 0, num * size);
@@ -562,7 +732,7 @@ void *vgl_calloc(size_t num, size_t size, vglMemType type) {
 	}
 #endif
 #ifdef HAVE_CUSTOM_HEAP
-	else if (num * size <= tm_free[type]) {
+	else if (num * size <= tm_max_failed_alloc[type]) {
 		void *ret = heap_alloc(type, num * size, MEM_ALIGNMENT);
 		if (ret) {
 			sceClibMemset(ret, 0, num * size);
@@ -584,11 +754,11 @@ void *vgl_memalign(size_t alignment, size_t size, vglMemType type) {
 		return memalign(alignment, size);
 #endif
 #ifdef PHYCONT_ON_DEMAND
-	else if (type == VGL_MEM_SLOW)
+	else if (type == VGL_MEM_PHYCONT)
 		return vgl_alloc_phycont_block(size);
 #endif
 #ifdef HAVE_CUSTOM_HEAP
-	else if (size <= tm_free[type])
+	else if (size <= tm_max_failed_alloc[type])
 		return heap_alloc(type, size, alignment);
 #else
 	else if (mempool_mspace[type])
@@ -598,18 +768,27 @@ void *vgl_memalign(size_t alignment, size_t size, vglMemType type) {
 }
 
 void *vgl_realloc(void *ptr, size_t size) {
+	if (!ptr) {
+#ifdef HAVE_WRAPPED_ALLOCATORS
+		return __real_malloc(size);
+#else
+		return malloc(size);
+#endif
+	}
 	vglMemType type = vgl_mem_get_type_by_addr(ptr);
-	if (type == VGL_MEM_EXTERNAL)
+	if (type == VGL_MEM_EXTERNAL) {
 #ifdef HAVE_WRAPPED_ALLOCATORS
 		return __real_realloc(ptr, size);
 #else
 		return realloc(ptr, size);
 #endif
+	}
 #ifdef PHYCONT_ON_DEMAND
-	else if (type == VGL_MEM_SLOW) {
+	if (type == VGL_MEM_PHYCONT) {
 		size_t old_size = vgl_malloc_usable_size(ptr);
-		if (old_size >= size)
+		if (old_size >= size) {
 			return ptr;
+		}
 		void *res = vgl_alloc_phycont_block(size);
 		if (res) {
 			vgl_fast_memcpy(res, ptr, old_size);
@@ -619,8 +798,8 @@ void *vgl_realloc(void *ptr, size_t size) {
 	}
 #endif
 #ifndef HAVE_CUSTOM_HEAP
-	else if (mempool_mspace[type])
-		return sceClibMspaceRealloc(mempool_mspace[type], ptr, size);
+	return sceClibMspaceRealloc(mempool_mspace[type], ptr, size);
+#else
+	return heap_realloc(type, ptr, size);
 #endif
-	return NULL;
 }
