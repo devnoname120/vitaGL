@@ -107,6 +107,9 @@ inline float4 texture2DProj(sampler2D s, float4 c, float b) { return tex2Dbias(s
 inline float4 texture2DProj(sampler2D s, float3 c, float b) { return tex2Dbias(s, float4(c.xy / c.z, 1, b)); }
 #define inversesqrt rsqrt
 #define samplerCube samplerCUBE
+#define sampler2DShadow sampler2D
+inline float shadow2DEXT(sampler2D x, float3 s) { return tex2D<float>(x, s).x; }
+#define gl_FragDepthEXT gl_FragDepth
 inline float4 glslTexture2D(sampler2D x, float2 s) { return tex2D(x,s); }
 inline float4 glslTexture2D(sampler2D x, float3 s) { return tex2D(x,s); }
 inline float4 glslTexture2D(sampler2D x, float2 s, float b) { return tex2Dbias(x,float4(s,1,b)); }

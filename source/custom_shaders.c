@@ -3943,6 +3943,23 @@ void glGetActiveAttrib(GLuint prog, GLuint index, GLsizei bufSize, GLsizei *leng
 	*size = 1;
 }
 
+static GLsizei copy_active_uniform_name(GLchar *name, GLsizei bufSize, const char *pname, GLint array_size) {
+	if (!name || bufSize <= 0 || !pname)
+		return 0;
+	const char *suffix = array_size > 1 && !strchr(pname, '[') ? "[0]" : "";
+	size_t capacity = (size_t)bufSize - 1;
+	size_t name_length = strlen(pname);
+	size_t copied = name_length < capacity ? name_length : capacity;
+	memcpy(name, pname, copied);
+	size_t suffix_length = strlen(suffix);
+	size_t suffix_capacity = capacity - copied;
+	size_t suffix_copied = suffix_length < suffix_capacity ? suffix_length : suffix_capacity;
+	memcpy(name + copied, suffix, suffix_copied);
+	copied += suffix_copied;
+	name[copied] = 0;
+	return (GLsizei)copied;
+}
+
 void glGetActiveUniform(GLuint prog, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) {
 	THREAD_SAFE()
 
@@ -4009,11 +4026,9 @@ void glGetActiveUniform(GLuint prog, GLuint index, GLsizei bufSize, GLsizei *len
 	else if (!strcmp(pname, "_sampler"))
 		pname = "sampler";
 
-	bufSize = min(strlen(pname), bufSize - 1);
+	GLsizei copied = copy_active_uniform_name(name, bufSize, pname, *size);
 	if (length)
-		*length = bufSize;
-	strncpy(name, pname, bufSize);
-	name[bufSize] = 0;
+		*length = copied;
 }
 
 /*
