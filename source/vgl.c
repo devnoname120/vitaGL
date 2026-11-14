@@ -213,8 +213,9 @@ GLboolean vglInitWithCustomSizes(int pool_size, int width, int height, int ram_p
 #endif
 
 #if defined(HAVE_SHADER_CACHE) || defined(HAVE_TEX_CACHE)
-	char titleid[12];
-	sceAppMgrAppParamGetString(0, 12, titleid , 256);
+	char titleid[12] = {0};
+	sceAppMgrAppParamGetString(0, 12, titleid, sizeof(titleid));
+	titleid[sizeof(titleid) - 1] = 0;
 #endif
 #ifdef HAVE_TEX_CACHE
 	sceIoMkdir("ux0:data/vgl_cache", 0777);
