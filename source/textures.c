@@ -944,6 +944,26 @@ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture
 	}
 }
 
+#ifndef TEXTURES_SPEEDHACK
+static GLboolean relocate_texture_for_subimage(texture *tex, uint32_t size) {
+	void *texture_data = gpu_alloc_mapped_for_gpu(size);
+	if (!texture_data) {
+		// Exhausted recovery has synchronized GXM, so the valid storage can be updated in place.
+		tex->last_frame = OBJ_NOT_USED;
+		return GL_FALSE;
+	}
+	vgl_fast_memcpy(texture_data, tex->data, size);
+	gpu_free_texture_data(tex);
+	sceGxmTextureSetData(&tex->gxm_tex, texture_data);
+	tex->data = texture_data;
+	tex->last_frame = OBJ_NOT_USED;
+#ifdef HAVE_TEX_CACHE
+	mark_as_cacheable(tex)
+#endif
+	return GL_TRUE;
+}
+#endif
+
 static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
 #ifdef HAVE_UNPURE_TEXTURES
 	level -= tex->mip_start;
@@ -999,15 +1019,7 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
 		} else {
 			size = orig_h * VGL_ALIGN(orig_w, 8) * bpp;
 		}
-		void *texture_data = gpu_alloc_mapped_for_gpu(size);
-		vgl_fast_memcpy(texture_data, tex->data, size);
-		gpu_free_texture_data(tex);
-		sceGxmTextureSetData(&tex->gxm_tex, texture_data);
-		tex->data = texture_data;
-		tex->last_frame = OBJ_NOT_USED;
-#ifdef HAVE_TEX_CACHE
-		mark_as_cacheable(tex)
-#endif
+		relocate_texture_for_subimage(tex, size);
 	}
 #endif
 	// Calculating start address of requested texture modification
