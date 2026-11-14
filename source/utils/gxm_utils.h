@@ -66,11 +66,25 @@ static inline __attribute__((always_inline)) void vglRestoreVertexUniformBuffer(
 		sceGxmSetVertexDefaultUniformBuffer(gxm_context, vgl_def_vert_buf);
 }
 static inline __attribute__((always_inline)) void *vglReserveFragmentUniformBuffer(uint32_t size) {
+#ifdef VGL_USE_GXM_FRAGMENT_UNIFORM_RING
+	void *reserved = NULL;
+	if (sceGxmReserveFragmentDefaultUniformBuffer(gxm_context, &reserved) >= 0 && reserved) {
+		vgl_def_frag_buf = reserved;
+		return reserved;
+	}
+#endif
 	vgl_def_frag_buf = vglReserveUniformCircularPoolBuffer(size);
 	sceGxmSetFragmentDefaultUniformBuffer(gxm_context, vgl_def_frag_buf);
 	return vgl_def_frag_buf;
 }
 static inline __attribute__((always_inline)) void *vglReserveVertexUniformBuffer(uint32_t size) {
+#ifdef VGL_USE_GXM_VERTEX_UNIFORM_RING
+	void *reserved = NULL;
+	if (sceGxmReserveVertexDefaultUniformBuffer(gxm_context, &reserved) >= 0 && reserved) {
+		vgl_def_vert_buf = reserved;
+		return reserved;
+	}
+#endif
 	vgl_def_vert_buf = vglReserveUniformCircularPoolBuffer(size);
 	sceGxmSetVertexDefaultUniformBuffer(gxm_context, vgl_def_vert_buf);
 	return vgl_def_vert_buf;
