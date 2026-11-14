@@ -428,6 +428,199 @@ static inline GLboolean does_color_material_track(GLenum pname) {
 	return color_material_mode == pname || (color_material_mode == GL_AMBIENT_AND_DIFFUSE && (pname == GL_AMBIENT || pname == GL_DIFFUSE));
 }
 
+#ifndef FFP_FRAGMENT_PROGRAM_CACHE_SIZE
+#define FFP_FRAGMENT_PROGRAM_CACHE_SIZE 512
+#endif
+#ifdef HAVE_FFP_FRAGMENT_PROGRAM_CACHE
+typedef struct {
+	GLboolean used;
+	SceGxmShaderPatcherId fragment_program_id;
+	SceGxmShaderPatcherId vertex_program_id;
+	SceGxmOutputRegisterFormat output_format;
+	SceGxmMultisampleMode multisample_mode;
+	uint32_t blend_raw;
+	const SceGxmProgram *vertex_program;
+	SceGxmFragmentProgram *program;
+} cached_ffp_fragment_program;
+
+static cached_ffp_fragment_program ffp_fragment_program_cache[FFP_FRAGMENT_PROGRAM_CACHE_SIZE];
+static uint32_t ffp_fragment_program_cache_hits;
+static uint32_t ffp_fragment_program_cache_misses;
+static uint32_t ffp_fragment_program_cache_stores;
+static uint32_t ffp_fragment_program_cache_invalidations;
+static uint32_t ffp_fragment_program_cache_full;
+
+static GLboolean ffp_fragment_program_cache_equal(
+		const cached_ffp_fragment_program *entry,
+		SceGxmShaderPatcherId fragment_program_id,
+		SceGxmShaderPatcherId vertex_program_id,
+		SceGxmOutputRegisterFormat output_format,
+		SceGxmMultisampleMode multisample_mode,
+		uint32_t blend_raw,
+		const SceGxmProgram *vertex_program) {
+	return entry->used &&
+		entry->fragment_program_id == fragment_program_id &&
+		entry->vertex_program_id == vertex_program_id &&
+		entry->output_format == output_format &&
+		entry->multisample_mode == multisample_mode &&
+		entry->blend_raw == blend_raw &&
+		entry->vertex_program == vertex_program;
+}
+
+static SceGxmFragmentProgram *ffp_fragment_program_cache_get(
+		SceGxmShaderPatcherId fragment_program_id,
+		SceGxmShaderPatcherId vertex_program_id,
+		SceGxmOutputRegisterFormat output_format,
+		SceGxmMultisampleMode multisample_mode,
+		uint32_t blend_raw,
+		const SceGxmBlendInfo *blend_info,
+		const SceGxmProgram *vertex_program) {
+	cached_ffp_fragment_program *free_entry = NULL;
+	for (uint32_t i = 0; i < FFP_FRAGMENT_PROGRAM_CACHE_SIZE; i++) {
+		cached_ffp_fragment_program *entry = &ffp_fragment_program_cache[i];
+		if (!entry->used) {
+			if (!free_entry)
+				free_entry = entry;
+			continue;
+		}
+		if (ffp_fragment_program_cache_equal(entry,
+				fragment_program_id,
+				vertex_program_id,
+				output_format,
+				multisample_mode,
+				blend_raw,
+				vertex_program)) {
+			ffp_fragment_program_cache_hits++;
+			return entry->program;
+		}
+	}
+
+	ffp_fragment_program_cache_misses++;
+	SceGxmFragmentProgram *program = NULL;
+	if (sceGxmShaderPatcherCreateFragmentProgram(gxm_shader_patcher,
+			fragment_program_id,
+			output_format,
+			multisample_mode,
+			blend_info,
+			vertex_program,
+			&program) != 0 || !program)
+		return NULL;
+	if (!free_entry) {
+		ffp_fragment_program_cache_full++;
+		return program;
+	}
+
+	free_entry->used = GL_TRUE;
+	free_entry->fragment_program_id = fragment_program_id;
+	free_entry->vertex_program_id = vertex_program_id;
+	free_entry->output_format = output_format;
+	free_entry->multisample_mode = multisample_mode;
+	free_entry->blend_raw = blend_raw;
+	free_entry->vertex_program = vertex_program;
+	free_entry->program = program;
+	ffp_fragment_program_cache_stores++;
+	return program;
+}
+
+static void ffp_fragment_program_cache_invalidate_fragment(
+		SceGxmShaderPatcherId fragment_program_id) {
+	for (uint32_t i = 0; i < FFP_FRAGMENT_PROGRAM_CACHE_SIZE; i++) {
+		cached_ffp_fragment_program *entry = &ffp_fragment_program_cache[i];
+		if (!entry->used || entry->fragment_program_id != fragment_program_id)
+			continue;
+		entry->used = GL_FALSE;
+		entry->program = NULL;
+		ffp_fragment_program_cache_invalidations++;
+	}
+}
+
+static void ffp_fragment_program_cache_invalidate_vertex(
+		SceGxmShaderPatcherId vertex_program_id,
+		const SceGxmProgram *vertex_program) {
+	for (uint32_t i = 0; i < FFP_FRAGMENT_PROGRAM_CACHE_SIZE; i++) {
+		cached_ffp_fragment_program *entry = &ffp_fragment_program_cache[i];
+		if (!entry->used || entry->vertex_program_id != vertex_program_id ||
+			entry->vertex_program != vertex_program)
+			continue;
+		entry->used = GL_FALSE;
+		entry->program = NULL;
+		ffp_fragment_program_cache_invalidations++;
+	}
+}
+#endif /* HAVE_FFP_FRAGMENT_PROGRAM_CACHE */
+
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+static uint32_t ffp_runtime_reload_calls;
+static uint32_t ffp_runtime_mask_changes;
+static uint32_t ffp_runtime_vertex_shader_changes;
+static uint32_t ffp_runtime_fragment_shader_changes;
+static uint32_t ffp_runtime_fragment_relinks;
+static uint32_t ffp_runtime_fragment_uniform_uploads;
+static uint32_t ffp_runtime_vertex_uniform_uploads;
+static uint32_t ffp_runtime_mvp_recalculations;
+#endif
+
+void vglGetFfpVertexProgramCacheStats(uint32_t *hits,
+		uint32_t *misses,
+		uint32_t *stores,
+		uint32_t *invalidations,
+		uint32_t *full) {
+	if (hits) *hits = 0;
+	if (misses) *misses = 0;
+	if (stores) *stores = 0;
+	if (invalidations) *invalidations = 0;
+	if (full) *full = 0;
+}
+
+void vglGetFfpFragmentProgramCacheStats(uint32_t *hits,
+		uint32_t *misses,
+		uint32_t *stores,
+		uint32_t *invalidations,
+		uint32_t *full) {
+#ifdef HAVE_FFP_FRAGMENT_PROGRAM_CACHE
+	if (hits) *hits = ffp_fragment_program_cache_hits;
+	if (misses) *misses = ffp_fragment_program_cache_misses;
+	if (stores) *stores = ffp_fragment_program_cache_stores;
+	if (invalidations) *invalidations = ffp_fragment_program_cache_invalidations;
+	if (full) *full = ffp_fragment_program_cache_full;
+#else
+	if (hits) *hits = 0;
+	if (misses) *misses = 0;
+	if (stores) *stores = 0;
+	if (invalidations) *invalidations = 0;
+	if (full) *full = 0;
+#endif
+}
+
+void vglGetFfpRuntimeStats(uint32_t *reloads,
+		uint32_t *mask_changes,
+		uint32_t *vertex_shader_changes,
+		uint32_t *fragment_shader_changes,
+		uint32_t *fragment_relinks,
+		uint32_t *fragment_uniform_uploads,
+		uint32_t *vertex_uniform_uploads,
+		uint32_t *mvp_recalculations) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+	if (reloads) *reloads = ffp_runtime_reload_calls;
+	if (mask_changes) *mask_changes = ffp_runtime_mask_changes;
+	if (vertex_shader_changes) *vertex_shader_changes = ffp_runtime_vertex_shader_changes;
+	if (fragment_shader_changes) *fragment_shader_changes = ffp_runtime_fragment_shader_changes;
+	if (fragment_relinks) *fragment_relinks = ffp_runtime_fragment_relinks;
+	if (fragment_uniform_uploads) *fragment_uniform_uploads = ffp_runtime_fragment_uniform_uploads;
+	if (vertex_uniform_uploads) *vertex_uniform_uploads = ffp_runtime_vertex_uniform_uploads;
+	if (mvp_recalculations) *mvp_recalculations = ffp_runtime_mvp_recalculations;
+#else
+	if (reloads) *reloads = 0;
+	if (mask_changes) *mask_changes = 0;
+	if (vertex_shader_changes) *vertex_shader_changes = 0;
+	if (fragment_shader_changes) *fragment_shader_changes = 0;
+	if (fragment_relinks) *fragment_relinks = 0;
+	if (fragment_uniform_uploads) *fragment_uniform_uploads = 0;
+	if (vertex_uniform_uploads) *vertex_uniform_uploads = 0;
+	if (mvp_recalculations) *mvp_recalculations = 0;
+#endif
+}
+
 void adjust_color_material_state() {
 	if (!color_material_state)
 		return;
@@ -595,6 +788,9 @@ static GLboolean append_ffp_shader_source(char *destination, size_t capacity, co
 }
 
 uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *streams, SceGxmIndexSource index_type) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+	ffp_runtime_reload_calls++;
+#endif
 #ifdef HAVE_PROFILING
 	uint32_t reload_ffp_shaders_start = sceKernelGetProcessTimeLow();
 #endif
@@ -791,6 +987,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 		ffp_dirty_vert = GL_FALSE;
 		ffp_dirty_frag = GL_FALSE;
 	} else {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_mask_changes++;
+#endif
 		ffp_dirty_frag_blend = GL_TRUE; // We need to relink fragment with vertex shader if mask changed
 
 		if ((ffp_mask.raw & VERTEX_SHADER_MASK) == vert_shader_mask) {
@@ -832,6 +1031,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 
 	// Checking if vertex shader requires a recompilation
 	if (ffp_dirty_vert) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_vertex_shader_changes++;
+#endif
 		char fname[256];
 #ifdef HAVE_HIGH_FFP_TEXUNITS
 		sprintf(fname, "ux0:data/shader_cache/v%d/v/%016llX-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
@@ -878,6 +1080,11 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 		if (vert_shader_cache_size < SHADER_CACHE_SIZE) {
 			vert_shader_cache_size++;
 		} else {
+#ifdef HAVE_FFP_FRAGMENT_PROGRAM_CACHE
+			ffp_fragment_program_cache_invalidate_vertex(
+				vert_shader_cache[vert_shader_cache_idx].id,
+				vert_shader_cache[vert_shader_cache_idx].prog);
+#endif
 			vglVertexProgramCacheInvalidate(vert_shader_cache[vert_shader_cache_idx].id);
 			vgl_free(vert_shader_cache[vert_shader_cache_idx].prog);
 			vgl_free(vert_shader_cache[vert_shader_cache_idx].unif_buf);
@@ -1056,6 +1263,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 
 	// Checking if fragment shader requires a recompilation
 	if (ffp_dirty_frag) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_fragment_shader_changes++;
+#endif
 		char fname[256];
 #ifndef DISABLE_TEXTURE_COMBINER
 #ifdef HAVE_HIGH_FFP_TEXUNITS
@@ -1180,6 +1390,10 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 		if (frag_shader_cache_size < SHADER_CACHE_SIZE) {
 			frag_shader_cache_size++;
 		} else {
+#ifdef HAVE_FFP_FRAGMENT_PROGRAM_CACHE
+			ffp_fragment_program_cache_invalidate_fragment(
+				frag_shader_cache[frag_shader_cache_idx].id);
+#endif
 			sceGxmShaderPatcherForceUnregisterProgram(gxm_shader_patcher, frag_shader_cache[frag_shader_cache_idx].id);
 			vgl_free(frag_shader_cache[frag_shader_cache_idx].prog);
 			if (frag_shader_cache[frag_shader_cache_idx].unif_buf) {
@@ -1219,7 +1433,23 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 
 	// Checking if fragment shader requires a blend settings change
 	if (ffp_dirty_frag_blend) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_fragment_relinks++;
+#endif
+#ifdef HAVE_FFP_FRAGMENT_PROGRAM_CACHE
+		ffp_fragment_program_patched = ffp_fragment_program_cache_get(
+			ffp_fragment_program_id,
+			ffp_vertex_program_id,
+			SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+			VGL_ACTIVE_MSAA_MODE,
+			blend_info.raw,
+			&blend_info.info,
+			ffp_vertex_program);
+		if (!ffp_fragment_program_patched)
+			return draw_mask_state;
+#else
 		rebuild_frag_shader(ffp_fragment_program_id, &ffp_fragment_program_patched, ffp_vertex_program, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4);
+#endif
 
 		// Updating current fixed function pipeline blend config
 		ffp_blend_info.raw = blend_info.raw;
@@ -1233,6 +1463,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 
 	// Recalculating MVP matrix if necessary
 	if (mvp_modified) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_mvp_recalculations++;
+#endif
 #ifndef HAVE_WVP_ON_GPU
 		matrix4x4_multiply(vgl_mvp_matrix, projection_matrix, modelview_matrix);
 #endif
@@ -1250,6 +1483,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 			vglSetUniformData(ffp_fragment_unif_buf + ffp_fragment_params[x], SCE_GXM_PARAMETER_TYPE_F32, offs, cnt, size, ptr, SCE_GXM_PARAMETER_TYPE_F32); \
 		}
 	if (dirty_frag_unifs) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_fragment_uniform_uploads++;
+#endif
 		if (ffp_fragment_unif_buf_size) {
 			uint8_t *buffer = vglReserveFragmentUniformBuffer(ffp_fragment_unif_buf_size);
 			if (ffp_fragment_params[ALPHA_CUT_UNIF] >= 0) {
@@ -1322,6 +1558,9 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
 			vglSetUniformData(ffp_vertex_unif_buf + ffp_vertex_params[x], SCE_GXM_PARAMETER_TYPE_F32, offs, cnt, size, ptr, SCE_GXM_PARAMETER_TYPE_F32); \
 		}
 	if (dirty_vert_unifs) {
+#ifdef HAVE_FFP_VERTEX_PROGRAM_CACHE
+		ffp_runtime_vertex_uniform_uploads++;
+#endif
 		uint8_t *buffer = vglReserveVertexUniformBuffer(ffp_vertex_unif_buf_size);
 		if (ffp_vertex_params[CLIP_PLANES_EQUATION_UNIF] >= 0) {
 			upload_ffp_vertex_unif(CLIP_PLANES_EQUATION_UNIF, 0, mask.clip_planes_num, 4, &clip_planes[0].x)
@@ -3789,7 +4028,7 @@ void glLightModelfv(GLenum pname, const GLfloat *params) {
 		if (_vgl_enqueue_list_func_with_ptr(glLightModelfv, DLIST_FUNC_U32_U32, 1, params, sizeof(GLfloat) * 4, pname)) {
 			return;
 		}
-	} else {
+	} else if (pname != GL_LIGHT_MODEL_TWO_SIDE) {
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, pname)
 	}
 #endif
@@ -3801,6 +4040,8 @@ void glLightModelfv(GLenum pname, const GLfloat *params) {
 #endif
 
 	switch (pname) {
+	case GL_LIGHT_MODEL_TWO_SIDE:
+		break;
 	case GL_LIGHT_MODEL_AMBIENT:
 		vgl_fast_memcpy(&light_global_ambient.r, params, sizeof(float) * 4);
 		flag_dirty_ffp_unif(shading_mode == SMOOTH, LIGHT_GLOBAL_AMBIENT_V_UNIF, LIGHT_GLOBAL_AMBIENT_F_UNIF)
@@ -3819,7 +4060,7 @@ void glLightModelxv(GLenum pname, const GLfixed *params) {
 		if (_vgl_enqueue_list_func_with_ptr(glLightModelxv, DLIST_FUNC_U32_U32, 1, params, sizeof(GLfixed) * 4, pname)) {
 			return;
 		}
-	} else {
+	} else if (pname != GL_LIGHT_MODEL_TWO_SIDE) {
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, pname)
 	}
 #endif
@@ -3831,6 +4072,8 @@ void glLightModelxv(GLenum pname, const GLfixed *params) {
 #endif
 
 	switch (pname) {
+	case GL_LIGHT_MODEL_TWO_SIDE:
+		break;
 	case GL_LIGHT_MODEL_AMBIENT:
 		light_global_ambient.r = (float)params[0] / 65536.0f;
 		light_global_ambient.g = (float)params[1] / 65536.0f;

@@ -125,6 +125,7 @@ extern "C" {
 #define GL_CULL_FACE_MODE                               0x0B45
 #define GL_FRONT_FACE                                   0x0B46
 #define GL_LIGHTING                                     0x0B50
+#define GL_LIGHT_MODEL_TWO_SIDE                         0x0B52
 #define GL_LIGHT_MODEL_AMBIENT                          0x0B53
 #define GL_SHADE_MODEL                                  0x0B54
 #define GL_COLOR_MATERIAL                               0x0B57
@@ -1185,6 +1186,11 @@ void *vglGetCaveBuffer(size_t *sz);
 
 // Get the current frame number.
 uint32_t vglGetFrameNumber();
+
+// Read cumulative fixed-function vertex program cache counters (zero: the library's own vertex program cache replaced it).
+void vglGetFfpVertexProgramCacheStats(uint32_t *hits, uint32_t *misses, uint32_t *stores, uint32_t *invalidations, uint32_t *full);
+void vglGetFfpFragmentProgramCacheStats(uint32_t *hits, uint32_t *misses, uint32_t *stores, uint32_t *invalidations, uint32_t *full);
+void vglGetFfpRuntimeStats(uint32_t *reloads, uint32_t *mask_changes, uint32_t *vertex_shader_changes, uint32_t *fragment_shader_changes, uint32_t *fragment_relinks, uint32_t *fragment_uniform_uploads, uint32_t *vertex_uniform_uploads, uint32_t *mvp_recalculations);
 
 // Get a GL function name given a function address.
 char *vglGetFuncName(uint32_t func);
