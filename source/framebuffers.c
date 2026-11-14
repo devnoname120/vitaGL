@@ -22,6 +22,9 @@
  */
 
 #include "shared.h"
+#ifdef HAVE_DEPTH_TEXTURES
+#include "depth_texture.h"
+#endif
 
 static framebuffer framebuffers[BUFFERS_NUM]; // Framebuffers array
 static renderbuffer renderbuffers[BUFFERS_NUM]; // Renderbuffers array
@@ -50,6 +53,9 @@ static void update_framebuffer_msaa(framebuffer *fb, SceGxmMultisampleMode mode)
 		mark_rt_as_dirty(fb->target);
 		fb->target = NULL;
 	}
+#ifdef HAVE_DEPTH_TEXTURES
+	vgl_depth_framebuffer_detach(fb);
+#endif
 	if (fb->depthbuffer_ptr) {
 #ifndef DEPTH_STENCIL_HACK
 		mark_depth_stencil_as_dirty(fb->depthbuffer_ptr);
@@ -247,6 +253,9 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
 #endif
 	for (i = 0; i < BUFFERS_NUM; i++) {
 		if (!framebuffers[i].active) {
+#ifdef HAVE_DEPTH_TEXTURES
+			vgl_depth_framebuffer_detach(&framebuffers[i]);
+#endif
 			ids[j++] = (GLuint)&framebuffers[i];
 			framebuffers[i].active = GL_TRUE;
 #ifdef HAVE_ACCURATE_MSAA
@@ -299,6 +308,9 @@ void glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
 	while (n > 0) {
 		framebuffer *fb = (framebuffer *)ids[--n];
 		if (fb) {
+#ifdef HAVE_DEPTH_TEXTURES
+			vgl_depth_framebuffer_detach(fb);
+#endif
 			// Check if the framebuffer is currently bound
 			if (fb == active_read_fb) {
 				active_read_fb = NULL;
@@ -401,6 +413,9 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbu
 	}
 #endif
 
+#ifdef HAVE_DEPTH_TEXTURES
+	vgl_depth_framebuffer_detach(fb);
+#endif
 	// Discarding any previously bound hidden depth buffers
 	if (fb->depthbuffer_ptr) {
 #ifndef DEPTH_STENCIL_HACK
@@ -433,6 +448,9 @@ void glNamedFramebufferRenderbuffer(GLuint target, GLenum attachment, GLenum ren
 
 	framebuffer *fb = (framebuffer *)target;
 
+#ifdef HAVE_DEPTH_TEXTURES
+	vgl_depth_framebuffer_detach(fb);
+#endif
 	// Discarding any previously bound hidden depth buffers
 	if (fb->depthbuffer_ptr) {
 #ifndef DEPTH_STENCIL_HACK
@@ -525,8 +543,25 @@ inline void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum text
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, textarget)
 	} else if (tex_id >= TEXTURES_NUM) {
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_VALUE, tex_id)
+#ifdef HAVE_DEPTH_TEXTURES
+	} else if (attachment != GL_COLOR_ATTACHMENT0 && attachment != GL_DEPTH_ATTACHMENT) {
+#else
 	} else if (attachment != GL_COLOR_ATTACHMENT0) {
+#endif
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, attachment)		
+	}
+#endif
+#ifdef HAVE_DEPTH_TEXTURES
+
+	if (attachment == GL_DEPTH_ATTACHMENT) {
+		GLenum error = vgl_depth_framebuffer_attach(fb,tex_id?&texture_slots[tex_id]:NULL,level);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
+		return;
+	}
+	if (tex_id && vgl_is_depth_texture(&texture_slots[tex_id])) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+	if (attachment == GL_COLOR_ATTACHMENT0) {
+		GLenum error = vgl_depth_framebuffer_color(fb,tex_id?&texture_slots[tex_id]:NULL);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
 	}
 #endif
 
@@ -570,6 +605,14 @@ void glFramebufferTexture2DMultisample(GLenum target, GLenum attachment, GLenum 
 	}
 #endif
 
+#ifdef HAVE_DEPTH_TEXTURES
+	if (tex_id && vgl_is_depth_texture(&texture_slots[tex_id])) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+	if (attachment == GL_COLOR_ATTACHMENT0) {
+		GLenum error = vgl_depth_framebuffer_color(fb,tex_id?&texture_slots[tex_id]:NULL);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
+	}
+
+#endif
 	update_framebuffer_msaa(fb, gl_samples_to_gxm(samples));
 	_glFramebufferTexture2D(fb, attachment, &texture_slots[tex_id], tex_id);
 #else
@@ -589,8 +632,25 @@ inline void glNamedFramebufferTexture2D(GLuint target, GLenum attachment, GLenum
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, textarget)
 	} else if (tex_id >= TEXTURES_NUM) {
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_VALUE, tex_id)
+#ifdef HAVE_DEPTH_TEXTURES
+	} else if (attachment != GL_COLOR_ATTACHMENT0 && attachment != GL_DEPTH_ATTACHMENT) {
+#else
 	} else if (attachment != GL_COLOR_ATTACHMENT0) {
+#endif
 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, attachment)		
+	}
+#endif
+#ifdef HAVE_DEPTH_TEXTURES
+
+	if (attachment == GL_DEPTH_ATTACHMENT) {
+		GLenum error = vgl_depth_framebuffer_attach(fb,tex_id?&texture_slots[tex_id]:NULL,level);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
+		return;
+	}
+	if (tex_id && vgl_is_depth_texture(&texture_slots[tex_id])) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+	if (attachment == GL_COLOR_ATTACHMENT0) {
+		GLenum error = vgl_depth_framebuffer_color(fb,tex_id?&texture_slots[tex_id]:NULL);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
 	}
 #endif
 

@@ -22,6 +22,9 @@
  */
 
 #include "../shared.h"
+#ifdef HAVE_DEPTH_TEXTURES
+#include "../depth_texture.h"
+#endif
 
 #include "texture_swizzler.h"
 
@@ -841,6 +844,9 @@ void gpu_alloc_compressed_texture(int32_t mip_level, uint32_t w, uint32_t h, Sce
 }
 
 void gpu_alloc_mipmaps(int level, texture *tex) {
+#ifdef HAVE_DEPTH_TEXTURES
+	if (vgl_is_depth_texture(tex)) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+#endif
 	// Getting current mipmap count in passed texture
 	int count = tex->mip_count - 1;
 

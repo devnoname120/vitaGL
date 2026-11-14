@@ -22,6 +22,9 @@
  */
 
 #include "shared.h"
+#ifdef HAVE_DEPTH_TEXTURES
+#include "depth_texture.h"
+#endif
 
 #ifdef HAVE_UNPURE_TEXFORMATS
 #define resolve_tex_target(target, unresolved_action) \
@@ -965,6 +968,9 @@ static GLboolean relocate_texture_for_subimage(texture *tex, uint32_t size) {
 #endif
 
 static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
+#ifdef HAVE_DEPTH_TEXTURES
+	if (vgl_is_depth_texture(tex)) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+#endif
 #ifdef HAVE_UNPURE_TEXTURES
 	level -= tex->mip_start;
 #endif
@@ -1299,6 +1305,9 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
 }
 
 void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum internalFormat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
+#ifdef HAVE_DEPTH_TEXTURES
+	if (vgl_depth_texture_has_attachments(tex)) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+#endif
 	THREAD_SAFE()
 
 #ifdef HAVE_UNPURE_TEXTURES
@@ -1827,6 +1836,12 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
 	for (int j = 0; j < n; j++) {
 		GLuint i = gl_textures[j];
 		if (i > 0 && i < TEXTURES_NUM) {
+#ifdef HAVE_DEPTH_TEXTURES
+			if (vgl_is_depth_texture(&texture_slots[i])) {
+				vgl_depth_texture_delete_bindings(&texture_slots[i],i);
+				if (texture_slots[i].status == TEX_UNUSED) continue;
+			}
+#endif
 			switch (texture_slots[i].status) {
 			case TEX_VALID:
 				if (texture_slots[i].ref_counter > 0) {
@@ -1838,7 +1853,11 @@ void glDeleteTextures(GLsizei n, const GLuint *gl_textures) {
 							fb = active_write_fb;
 						if (fb) {
 							gpu_free_texture(&texture_slots[i]);
+#ifdef HAVE_DEPTH_TEXTURES
+							if (fb->depthbuffer_ptr && !vgl_depth_framebuffer_has_texture(fb)) {
+#else
 							if (fb->depthbuffer_ptr) {
+#endif
 #ifndef DEPTH_STENCIL_HACK
 								mark_depth_stencil_as_dirty(fb->depthbuffer_ptr);
 #endif
@@ -1890,6 +1909,15 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
 	int texture2d_idx;
 	resolve_tex_target(target, SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, target));
 	texture *tex = &texture_slots[texture2d_idx];
+#ifdef HAVE_DEPTH_TEXTURES
+	if (internalFormat == GL_DEPTH_COMPONENT) {
+		GLenum error = vgl_depth_texture_storage(tex,target,level,width,height,border,format,type,data);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
+		return;
+	}
+	if (vgl_depth_texture_has_attachments(tex)) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+
+#endif
 
 #ifndef SKIP_ERROR_HANDLING
 	// Checking if texture is too big for sceGxm
@@ -1944,6 +1972,15 @@ void glTextureImage2D(GLuint tex_id, GLint level, GLint internalFormat, GLsizei 
 	THREAD_SAFE()
 
 	texture *tex = &texture_slots[tex_id];
+#ifdef HAVE_DEPTH_TEXTURES
+	if (internalFormat == GL_DEPTH_COMPONENT) {
+		GLenum error = vgl_depth_texture_storage(tex,GL_TEXTURE_2D,level,width,height,border,format,type,data);
+		if (error != GL_NO_ERROR) { SET_GL_ERROR(error) }
+		return;
+	}
+	if (vgl_depth_texture_has_attachments(tex)) { SET_GL_ERROR(GL_INVALID_OPERATION) }
+
+#endif
 	
 #ifndef SKIP_ERROR_HANDLING
 	// Checking if texture is too big for sceGxm

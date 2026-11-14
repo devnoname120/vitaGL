@@ -22,6 +22,9 @@
  */
 
 #include "shared.h"
+#ifdef HAVE_DEPTH_TEXTURES
+#include "depth_texture.h"
+#endif
 
 #define MAX_SCENES_PER_FRAME 8 // Maximum amount of scenes per frame allowed by sceGxm per render target
 
@@ -590,6 +593,10 @@ static inline __attribute__((always_inline)) void scene_end(void) {
 		sceDisplayWaitVblankStartMulti(vsync_interval);
 }
 
+#ifdef HAVE_DEPTH_TEXTURES
+#include "depth_texture_scene.inc"
+
+#endif
 void scene_reset(void) {
 	if (in_use_framebuffer != active_write_fb || needs_scene_reset || dirty_framebuffer || dirty_query) {
 		scene_not_flushed = GL_TRUE;
@@ -647,6 +654,9 @@ void scene_reset(void) {
 			}
 #endif
 		} else {
+#ifdef HAVE_DEPTH_TEXTURES
+			vgl_depth_framebuffer_used(active_write_fb);
+#endif
 			// Double check that colorsurface and target texture are synced
 			if (sceGxmColorSurfaceGetData(&active_write_fb->colorbuffer) != active_write_fb->tex->data) {
 				_glFramebufferTexture2D(active_write_fb, GL_COLOR_ATTACHMENT0, active_write_fb->tex, 1);
