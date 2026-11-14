@@ -1,3 +1,13 @@
+// FFP_CENTROID_TEXCOORDS: the first two texture coordinates are interpolated at the centroid,
+// so a multisampled edge pixel does not sample outside its triangle's part of the texture.
+#ifdef FFP_CENTROID_TEXCOORDS
+#define FFP_TEXCOORD01_HALF "#define TEXCOORD0 TEXCOORD0_CENTROID_HALF\n#define TEXCOORD1 TEXCOORD1_CENTROID_HALF\n"
+#define FFP_TEXCOORD01_FULL "#else\n#define TEXCOORD0 TEXCOORD0_CENTROID\n#define TEXCOORD1 TEXCOORD1_CENTROID\n"
+#else
+#define FFP_TEXCOORD01_HALF "#define TEXCOORD0 TEXCOORD0_HALF\n#define TEXCOORD1 TEXCOORD1_HALF\n"
+#define FFP_TEXCOORD01_FULL ""
+#endif
+
 const char *ffp_frag_src =
 R"(uniform float2 Opass0_scale;
 uniform float2 Ppass1_scale;
@@ -18,14 +28,12 @@ uniform float2 Ppass1_scale;
 #define srgb_mode %d
 
 #if interp == 1
-#define TEXCOORD0 TEXCOORD0_HALF
-#define TEXCOORD1 TEXCOORD1_HALF
-#define TEXCOORD2 TEXCOORD2_HALF
+)" FFP_TEXCOORD01_HALF R"(#define TEXCOORD2 TEXCOORD2_HALF
 #define TEXCOORD3 TEXCOORD3_HALF
 #define TEXCOORD4 TEXCOORD4_HALF
 #define TEXCOORD5 TEXCOORD5_HALF
 #define TEXCOORD6 TEXCOORD6_HALF
-#endif
+)" FFP_TEXCOORD01_FULL R"(#endif
 
 #if lighting == 1 && shading_mode == 1 // GL_PHONG_WIN
 uniform float4 Flight_global_ambient;

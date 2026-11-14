@@ -128,7 +128,7 @@ extern void *fragment_usse_ring_buffer_addr[GXM_CONTEXTS_NUM]; // fragment USSE 
 extern SceGxmShaderPatcher *gxm_shader_patcher; // sceGxmShaderPatcher shader patcher instance
 
 // sceDisplay callback data struct
-struct display_queue_callback_data { void *addr; };
+struct display_queue_callback_data { void *addr; uint32_t sequence; };
 
 // Texture object status enum
 enum {
@@ -298,7 +298,13 @@ extern int NEW_DISPLAY_HEIGHT; // Requested new display height in pixels
 #include "texture_callbacks.h"
 
 // Fixed-function pipeline shader cache settings
+#ifdef FFP_CENTROID_TEXCOORDS
+// Centroid texture coordinates change the fixed-function fragment shaders: such a build keeps its
+// shader cache apart from the others in the shared ux0:data/shader_cache.
+#define FFP_SHADER_CACHE_MAGIC 9031 // This must be increased whenever ffp shader sources or shader mask/combiner mask changes
+#else
 #define FFP_SHADER_CACHE_MAGIC 31 // This must be increased whenever ffp shader sources or shader mask/combiner mask changes
+#endif
 
 // Custom shaders pipeline shader cache settings
 #ifdef HAVE_SHADER_CACHE

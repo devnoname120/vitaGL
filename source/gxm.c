@@ -54,6 +54,8 @@ SceGxmSyncObject *gxm_sync_objects[DISPLAY_MAX_BUFFER_COUNT]; // Display sync ob
 unsigned int gxm_front_buffer_index = 0; // Display front buffer id
 unsigned int gxm_back_buffer_index; // Display back buffer id
 static void (*vgl_display_cb)(void *framebuf) = NULL; // Additional custom callback used inside display queue callback
+static void (*vgl_display_complete_cb)(uint32_t sequence) = NULL;
+static uint32_t display_submission_sequence = 0;
 
 static void *gxm_shader_patcher_buffer_addr; // Shader PAtcher buffer memblock starting address
 static void *gxm_shader_patcher_vertex_usse_addr; // Shader Patcher vertex USSE memblock starting address
@@ -281,6 +283,9 @@ static void display_queue_callback(const void *callbackData) {
 	// Performing VSync if enabled
 	if (vsync_interval)
 		sceDisplayWaitVblankStartMulti(vsync_interval);
+
+	if (vgl_display_complete_cb)
+		vgl_display_complete_cb(cb_data->sequence);
 }
 
 // Garbage collector
@@ -969,6 +974,10 @@ void vglSwapBuffers(GLboolean has_commondialog) {
 #endif
 		struct display_queue_callback_data queue_cb_data;
 		queue_cb_data.addr = gxm_color_surfaces_addr[gxm_back_buffer_index];
+		display_submission_sequence++;
+		if (!display_submission_sequence)
+			display_submission_sequence++;
+		queue_cb_data.sequence = display_submission_sequence;
 #ifdef HAVE_PROFILING
 		tick = sceKernelGetProcessTimeLow();
 #endif
@@ -1047,6 +1056,14 @@ void glFlush(void) {
 
 void vglSetDisplayCallback(void (*cb)(void *framebuf)) {
 	vgl_display_cb = cb;
+}
+
+void vglSetDisplayCompleteCallback(void (*cb)(uint32_t sequence)) {
+	vgl_display_complete_cb = cb;
+}
+
+uint32_t vglGetDisplaySubmissionSequence(void) {
+	return display_submission_sequence;
 }
 
 void vglSetupShaderPatcher(uint32_t buffer_mem_size, uint32_t vertex_usse_mem_size, uint32_t fragment_usse_mem_size) {
