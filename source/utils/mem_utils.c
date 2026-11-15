@@ -884,6 +884,13 @@ void *vgl_realloc(void *ptr, size_t size) {
 #endif
 	}
 	vglMemType type = vgl_mem_get_type_by_addr(ptr);
+#ifndef PHYCONT_ON_DEMAND
+	// A block of no pool came from the C heap too: the heap can have memory outside the
+	// block recorded at start-up (a client that grows or replaces it), and there is no
+	// mspace to hand such a block to.
+	if (type == (vglMemType)-1)
+		type = VGL_MEM_EXTERNAL;
+#endif
 	if (type == VGL_MEM_EXTERNAL) {
 #ifdef HAVE_WRAPPED_ALLOCATORS
 		return __real_realloc(ptr, size);
