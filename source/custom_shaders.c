@@ -26,6 +26,9 @@
 #include "shared.h"
 #include "utils/glsl_utils.h"
 #include "utils/shacccg_paramquery.h"
+#ifdef HAVE_BIOSHOCK_RENDERER
+#include "bioshock_renderer.h"
+#endif
 #if defined(HAVE_SHADER_CACHE) || defined(HAVE_TEX_CACHE)
 #define XXH_STATIC_LINKING_ONLY
 #define XXH_IMPLEMENTATION
@@ -397,6 +400,11 @@ typedef struct {
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 	uint32_t vertex_layout_version;
 #endif
+#ifdef HAVE_BIOSHOCK_RENDERER
+	uint8_t validation; // Result of glValidateProgram (PROG_NOT_VALIDATED, PROG_VALIDATED, PROG_UBO_MISSING)
+	shader *public_vshader; // Attached shaders while vshader and fshader are a substituted pair (coordinate_pair_binary.inc)
+	shader *public_fshader;
+#endif
 } program;
 
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
@@ -522,6 +530,69 @@ static GLboolean ensure_custom_shader_storage(void) {
 	return progs ? GL_TRUE : GL_FALSE;
 }
 
+#ifdef HAVE_BIOSHOCK_RENDERER
+// Validation is separate from link success. An active uniform block without
+// backing storage cannot be used by this renderer; let callers defer warmup.
+enum {
+	PROG_NOT_VALIDATED,
+	PROG_VALIDATED,
+	PROG_UBO_MISSING
+};
+static const char program_validation_log[] = "Active uniform buffer has no backing storage";
+
+static GLboolean program_uniform_buffers_ready(const program *p) {
+	const ubo *heads[2] = {p->vert_ubos, p->frag_ubos};
+	for (unsigned stage = 0; stage < 2; stage++) {
+		unsigned visited = 0;
+		for (const ubo *u = heads[stage]; u; u = (const ubo *)u->chain) {
+			if (++visited > UBOS_NUM)
+				return GL_FALSE;
+			const ubo *b = stage == 0 && u->alias ? (const ubo *)u->alias : u;
+			if (b->bind >= UBOS_NUM || !ubo_buf[b->bind] || !ubo_buf[b->bind]->ptr)
+				return GL_FALSE;
+		}
+	}
+	return GL_TRUE;
+}
+
+// Private fault-only readout. No binding, draw or error-state modification.
+unsigned vgl_bioshock_bone_diag(uint32_t *out, unsigned capacity) {
+	if (!out || capacity < 16)
+		return 0;
+	for (unsigned i = 0; i < 16; i++)
+		out[i] = 0;
+	out[0] = 1;
+	out[1] = cur_program;
+	if (!progs || !cur_program || cur_program > MAX_CUSTOM_PROGRAMS)
+		return 16;
+	program *p = &progs[cur_program - 1];
+	out[2] = p->status;
+	out[3] = (uint32_t)(uintptr_t)p->vshader;
+	out[4] = (uint32_t)(uintptr_t)p->fshader;
+	ubo *u = p->vert_ubos;
+	out[5] = (uint32_t)(uintptr_t)u;
+	if (!u)
+		return 16;
+	ubo *b = u->alias ? u->alias : u;
+	out[6] = (uint32_t)(uintptr_t)b;
+	out[7] = b->bind;
+	out[8] = b->idx;
+	out[14] = (uint32_t)(uintptr_t)u->chain;
+	out[15] = (uint32_t)(uintptr_t)b->ptr;
+	if (b->bind >= UBOS_NUM)
+		return 16;
+	vbo *v = ubo_buf[b->bind];
+	out[9] = (uint32_t)(uintptr_t)v;
+	out[10] = ubo_offset[b->bind];
+	if (v) {
+		out[11] = (uint32_t)(uintptr_t)v->ptr;
+		out[12] = (uint32_t)v->size;
+		out[13] = v->last_frame;
+	}
+	return 16;
+}
+#endif
+
 #ifdef HAVE_SHARK_LOG
 static char *shark_log = NULL;
 #endif
@@ -577,9 +648,25 @@ void release_shader(shader *s) {
 	if (s->source) {
 		vgl_free(s->source);
 	}
+#ifdef HAVE_BIOSHOCK_RENDERER
+	// A program's private substituted shader is not in the table
+	if (shaders[s->slot] == s)
+		shaders[s->slot] = NULL;
+#else
 	shaders[s->slot] = NULL;
+#endif
 	vgl_free(s);
 }
+
+// Shaders attached to a program, as queries see them
+#ifdef HAVE_BIOSHOCK_RENDERER
+#include "coordinate_pair_binary.inc"
+#define attached_vshader(p) coordinate_public_vertex(p)
+#define attached_fshader(p) coordinate_public_fragment(p)
+#else
+#define attached_vshader(p) ((p)->vshader)
+#define attached_fshader(p) ((p)->fshader)
+#endif
 
 float *reserve_attrib_pool(uint8_t count) {
 	float *res = cur_vao->vertex_attrib_pool_ptr;
@@ -966,10 +1053,15 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
 		SceShaccCgParameter param = sceShaccCgGetFirstParameter(cout);
 		while (param) {
 			if (sceShaccCgGetParameterClass(param) == SCE_SHACCCG_PARAMETERCLASS_MATRIX) {
-				matrix_uniform *m = (matrix_uniform *)vglMalloc(sizeof(matrix_uniform));
-				m->ptr = sceGxmProgramFindParameterByName(s->prog, sceShaccCgGetParameterName(param));
-				m->chain = s->mat;
-				s->mat = m;
+				// Reflection includes matrices removed by dead-code elimination.
+				// A missing compiled parameter must not become a cache index.
+				const SceGxmProgramParameter *compiled = sceGxmProgramFindParameterByName(s->prog, sceShaccCgGetParameterName(param));
+				if (compiled) {
+					matrix_uniform *m = (matrix_uniform *)vglMalloc(sizeof(matrix_uniform));
+					m->ptr = compiled;
+					m->chain = s->mat;
+					s->mat = m;
+				}
 			} else if (sceShaccCgGetParameterClass(param) == SCE_SHACCCG_PARAMETERCLASS_UNIFORMBLOCK) {
 				block_uniform *b = (block_uniform *)vglMalloc(sizeof(block_uniform));
 				b->idx = sceShaccCgGetParameterBufferIndex(param);
@@ -1017,6 +1109,9 @@ void reset_custom_shaders(void) {
 	// Init custom programs
 	for (int i = 0; i < MAX_CUSTOM_PROGRAMS; i++) {
 		progs[i].status = PROG_INVALID;
+#ifdef HAVE_BIOSHOCK_RENDERER
+		progs[i].validation = PROG_NOT_VALIDATED;
+#endif
 	}
 }
 
@@ -2229,6 +2324,10 @@ void glShaderSource(GLuint handle, GLsizei count, const GLchar *const *string, c
 
 	s->source[size] = 0;
 	s->size = size;
+#ifdef HAVE_BIOSHOCK_RENDERER
+	// The loader may replace a known source in place; the shader cache hashes the result
+	s->size = ml_aggregate_shader_source(s->source, s->size, s->type);
+#endif
 }
 
 void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, const void *binary, GLsizei length) {
@@ -2287,8 +2386,8 @@ GLboolean glIsShader(GLuint name) {
     if (!s->dirty) return GL_TRUE;
     for (int i = 0; i < MAX_CUSTOM_PROGRAMS; ++i) {
         program *p = &progs[i];
-        if (p->status && ((!p->vertex_detached && p->vshader == s) ||
-                          (!p->fragment_detached && p->fshader == s))) return GL_TRUE;
+        if (p->status && ((!p->vertex_detached && attached_vshader(p) == s) ||
+                          (!p->fragment_detached && attached_fshader(p) == s))) return GL_TRUE;
     }
     return GL_FALSE;
 }
@@ -2311,8 +2410,11 @@ void glDetachShader(GLuint prog, GLuint name) {
     shader *s = shaders[name - ML_SHADER_HANDLE_BASE - 1];
     shader **slot;
     GLboolean *detached;
-    if (s == p->vshader && !p->vertex_detached) {slot=&p->vshader;detached=&p->vertex_detached;}
-    else if (s == p->fshader && !p->fragment_detached) {slot=&p->fshader;detached=&p->fragment_detached;}
+#ifdef HAVE_BIOSHOCK_RENDERER
+    if (p->status != PROG_LINKED) coordinate_pair_release(p);
+#endif
+    if (s == attached_vshader(p) && !p->vertex_detached) {slot=&p->vshader;detached=&p->vertex_detached;}
+    else if (s == attached_fshader(p) && !p->fragment_detached) {slot=&p->fshader;detached=&p->fragment_detached;}
     else {SET_GL_ERROR(GL_INVALID_OPERATION)}
     *detached = GL_TRUE;
     if (p->status != PROG_LINKED) {
@@ -2341,9 +2443,22 @@ void glAttachShader(GLuint prog, GLuint name) {
 }
 
 void glValidateProgram(GLuint name) {
+#ifdef HAVE_BIOSHOCK_RENDERER
+    /* A linked program validates only while every active uniform buffer has
+     * backing storage; the result is GL_VALIDATE_STATUS and the info log. */
+    THREAD_SAFE()
+    if (!progs || !name || name > MAX_CUSTOM_PROGRAMS || progs[name - 1].status == PROG_INVALID) {
+        if (glIsShader(name)) {SET_GL_ERROR(GL_INVALID_OPERATION)}
+        SET_GL_ERROR(GL_INVALID_VALUE)
+    }
+    program *p = &progs[name - 1];
+    p->validation = p->status != PROG_LINKED ? PROG_NOT_VALIDATED :
+        (program_uniform_buffers_ready(p) ? PROG_VALIDATED : PROG_UBO_MISSING);
+#else
     /* Optional shader-cache warmup validation is explicitly out of scope.
      * Keep the original VitaGL VALIDATE_STATUS query based on link status. */
     (void)name;
+#endif
 }
 
 
@@ -2354,9 +2469,9 @@ void glGetAttachedShaders(GLuint name, GLsizei maxCount, GLsizei *count, GLuint 
     program *p = &progs[name - 1];
     GLsizei n = 0;
     if (p->vshader && !p->vertex_detached && n < maxCount)
-        out[n++] = p->vshader->slot + 1 + ML_SHADER_HANDLE_BASE;
+        out[n++] = attached_vshader(p)->slot + 1 + ML_SHADER_HANDLE_BASE;
     if (p->fshader && !p->fragment_detached && n < maxCount)
-        out[n++] = p->fshader->slot + 1 + ML_SHADER_HANDLE_BASE;
+        out[n++] = attached_fshader(p)->slot + 1 + ML_SHADER_HANDLE_BASE;
     if (count) *count = n;
 }
 
@@ -2371,6 +2486,11 @@ GLuint glCreateProgram(void) {
 		if (!(progs[i - 1].status)) {
 			res = i--;
 			progs[i].status = PROG_UNLINKED;
+#ifdef HAVE_BIOSHOCK_RENDERER
+			progs[i].validation = PROG_NOT_VALIDATED;
+			progs[i].public_vshader = NULL;
+			progs[i].public_fshader = NULL;
+#endif
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 			progs[i].vertex_layout_version = ++vertex_program_layout_current_ver;
 #endif
@@ -2445,11 +2565,11 @@ void glGetProgramBinary(GLuint prog, GLsizei bufSize, GLsizei *length, GLenum *b
 	uint8_t *buf = (uint8_t *)binary + size;
 
 	// Dumping vertex binary
-	serialize_shader(&buf[sizeof(uint32_t)], (size_t *)buf, p->vshader, GL_FALSE);
+	serialize_shader(&buf[sizeof(uint32_t)], (size_t *)buf, attached_vshader(p), GL_FALSE);
 
 	// Dumping fragment binary
 	buf += sizeof(uint32_t) + *(uint32_t *)buf;
-	serialize_shader(&buf[sizeof(uint32_t)], (size_t *)buf, p->fshader, GL_FALSE);
+	serialize_shader(&buf[sizeof(uint32_t)], (size_t *)buf, attached_fshader(p), GL_FALSE);
 
 	if (length)
 		*length = ((uintptr_t)buf - (uintptr_t)binary) + sizeof(uint32_t) + *(uint32_t *)buf;
@@ -2518,6 +2638,9 @@ void glDeleteProgram(GLuint prog) {
 			vgl_free(p->glsl_attr_map);
 		}
 
+#ifdef HAVE_BIOSHOCK_RENDERER
+		coordinate_pair_release(p);
+#endif
 		// Checking if attached shaders are marked for deletion and should be deleted
 		if (p->vshader) {
 			p->vshader->ref_counter--;
@@ -2533,13 +2656,38 @@ void glDeleteProgram(GLuint prog) {
 		}
 	}
 	p->status = PROG_INVALID;
+#ifdef HAVE_BIOSHOCK_RENDERER
+	p->validation = PROG_NOT_VALIDATED;
+#endif
 }
 
 void glGetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei *length, GLchar *infoLog) {
 	THREAD_SAFE()
 
+#ifdef HAVE_BIOSHOCK_RENDERER
+	// The only program log is the reason glValidateProgram refused the program
+	if (maxLength < 0) {
+		SET_GL_ERROR(GL_INVALID_VALUE)
+	}
+	if (!progs || !program || program > MAX_CUSTOM_PROGRAMS || progs[program - 1].status == PROG_INVALID) {
+		SET_GL_ERROR(GL_INVALID_VALUE)
+	}
+	GLsizei copied = 0;
+	if (infoLog && maxLength > 0) {
+		if (progs[program - 1].validation == PROG_UBO_MISSING) {
+			copied = (GLsizei)sizeof(program_validation_log) - 1;
+			if (copied >= maxLength)
+				copied = maxLength - 1;
+			memcpy(infoLog, program_validation_log, (size_t)copied);
+		}
+		infoLog[copied] = 0;
+	}
+	if (length)
+		*length = copied;
+#else
 	if (length)
 		*length = 0;
+#endif
 }
 
 void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
@@ -2554,14 +2702,25 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
 
 	switch (pname) {
 	case GL_LINK_STATUS:
+#ifdef HAVE_BIOSHOCK_RENDERER
+		*params = p->status == PROG_LINKED;
+		break;
+	case GL_VALIDATE_STATUS:
+		*params = p->validation == PROG_VALIDATED;
+		break;
+	case GL_INFO_LOG_LENGTH:
+		*params = p->validation == PROG_UBO_MISSING ? (GLint)sizeof(program_validation_log) : 0;
+		break;
+#else
 	case GL_VALIDATE_STATUS:
 		*params = p->status == PROG_LINKED;
 		break;
 	case GL_INFO_LOG_LENGTH:
 		*params = 0;
 		break;
+#endif
 	case GL_PROGRAM_BINARY_LENGTH:
-		*params = serialized_shader_size(p->vshader, GL_FALSE, &dummy) + serialized_shader_size(p->fshader, GL_FALSE, &dummy) + sizeof(GLuint) * 3 + sizeof(SceGxmVertexAttribute) * VERTEX_ATTRIBS_NUM;
+		*params = serialized_shader_size(attached_vshader(p), GL_FALSE, &dummy) + serialized_shader_size(attached_fshader(p), GL_FALSE, &dummy) + sizeof(GLuint) * 3 + sizeof(SceGxmVertexAttribute) * VERTEX_ATTRIBS_NUM;
 		break;
 	case GL_ATTACHED_SHADERS:
 		*params = (p->vshader && !p->vertex_detached) + (p->fshader && !p->fragment_detached);
@@ -2606,6 +2765,10 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
 	}
 }
 
+#ifdef HAVE_BIOSHOCK_RENDERER
+#include "bone_buffer_metadata.inc"
+
+#endif
 void glLinkProgram(GLuint progr) {
 #ifdef HAVE_LINK_TRACE
 	sceClibPrintf("VGL_LINK enter program=%u\n", (unsigned)progr);
@@ -2619,6 +2782,9 @@ void glLinkProgram(GLuint progr) {
 	program *p = &progs[progr - 1];
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 	p->vertex_layout_version = ++vertex_program_layout_current_ver;
+#endif
+#ifdef HAVE_BIOSHOCK_RENDERER
+	p->validation = PROG_NOT_VALIDATED;
 #endif
     if (!p->vshader || !p->fshader || p->vertex_detached || p->fragment_detached) return;
 #ifndef SKIP_ERROR_HANDLING
@@ -2762,6 +2928,15 @@ void glLinkProgram(GLuint progr) {
 		vgl_log("%s:%d: %s: A program has been re-linked. vitaGL doesn't support re-linking, glitches may happen.\n", __FILE__, __LINE__, __func__);
 		return;
 	}
+#ifdef HAVE_BIOSHOCK_RENDERER
+	// Both stages are compiled: substitute a pair the loader knows, then give
+	// the vertex program that will run its bone palette block
+	coordinate_pair_prepare(p);
+	if (!ml_bioshock_bone_buffer_metadata(p->vshader)) {
+		coordinate_pair_release(p);
+		return;
+	}
+#endif
 	p->status = PROG_LINKED;
 #ifdef HAVE_LINK_TRACE
 	sceClibPrintf("VGL_LINK metadata_begin program=%u vertex=%08X fragment=%08X\n",

@@ -543,6 +543,11 @@ void glGetIntegerv(GLenum pname, GLint *data) {
 	case GL_ARRAY_BUFFER_BINDING:
 		*data = vertex_array_unit;
 		break;
+#ifdef HAVE_BIOSHOCK_RENDERER
+	case 0x8A28: // GL_UNIFORM_BUFFER_BINDING, the buffer bound to GL_UNIFORM_BUFFER (not named by vitaGL.h)
+		*data = uniform_array_unit;
+		break;
+#endif
 	case GL_ELEMENT_ARRAY_BUFFER_BINDING:
 		*data = cur_vao->index_array_unit;
 		break;

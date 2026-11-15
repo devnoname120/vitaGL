@@ -158,18 +158,39 @@ static inline __attribute__((always_inline)) uint32_t vgl_cache_old_textures(siz
 #endif
 
 int unsafe_allocator_counter = 0;
+#if defined(HAVE_BIOSHOCK_RENDERER) && !(defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD))
+
+// Returns once the garbage collector has run every cycle queued so far, the
+// one just requested included: only then are all its slots free again.
+// Waiting for the collector instead of a fixed second keeps level loads, which
+// present no frames and so only reclaim memory here, from stalling. With no
+// delay, the callers must have waited for the GPU themselves.
+static void wait_gc_cycles(void) {
+	sceKernelWaitSema(gc_mutex[1], FRAME_PURGE_FREQ, NULL);
+	sceKernelSignalSema(gc_mutex[1], FRAME_PURGE_FREQ);
+}
+
+#endif
 void *gpu_alloc_mapped_aligned_unsafe_for_cpu(size_t alignment, size_t size) {
 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
 	unsafe_allocator_counter++;
 	if (unsafe_allocator_counter == 1) {
 		glFinish();
+#ifdef HAVE_BIOSHOCK_RENDERER
+		// glFinish returns without waiting when the last scene change was a flush
+		sceGxmFinish(gxm_context);
+#endif
 	}
 #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
 	garbage_collector(0, NULL);
 #else
 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
 	sceKernelSignalSema(gc_mutex[0], 1);
+#ifdef HAVE_BIOSHOCK_RENDERER
+	wait_gc_cycles();
+#else
 	sceKernelDelayThread(1000000);
+#endif
 #endif
 
 	// Allocating requested memblock
@@ -195,7 +216,11 @@ void *gpu_alloc_mapped_aligned_unsafe_for_gpu(size_t alignment, size_t size) {
 #else
 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
 	sceKernelSignalSema(gc_mutex[0], 1);
+#ifdef HAVE_BIOSHOCK_RENDERER
+	wait_gc_cycles();
+#else
 	sceKernelDelayThread(1000000);
+#endif
 #endif
 
 	// Allocating requested memblock

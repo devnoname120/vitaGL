@@ -22,6 +22,10 @@
  */
 
 #include "shared.h"
+#ifdef HAVE_BIOSHOCK_RENDERER
+#include <stddef.h>
+#include "bioshock_renderer.h"
+#endif
 
 #define DISABLED_ATTRIBS_POOL_SIZE (256 * 1024) // Disabled attributes circular pool size in bytes for the default VAO
 #define DISABLED_AUX_ATTRIBS_POOL_SIZE (64 * 1024) // Disabled attributes circular pool size in bytes for non default VAOs
@@ -395,6 +399,41 @@ void glDeleteBuffers(GLsizei n, const GLuint *gl_buffers) {
 	}
 }
 
+#ifdef HAVE_BIOSHOCK_RENDERER
+// Fresh upload store reuse. The loader watches the guest's buffer calls: an
+// allocation-only glBufferData(GL_ARRAY_BUFFER, size, NULL, GL_STREAM_DRAW)
+// that gives a buffer its first store leaves a lease on that store, read
+// through vglFreshUploadRead. If the next upload to the buffer has the same
+// size and usage and the store is still exactly as leased, the loader grants
+// it (ml_fresh_upload_take in glNamedBufferData) and the data is copied into
+// that store instead of freeing it and allocating another.
+// MLFreshStore mirrors these vbo fields one to one.
+_Static_assert(sizeof(vbo) == 28 && offsetof(vbo, ptr) == 0 && offsetof(vbo, size) == 4 && offsetof(vbo, alloc_func) == 8 && offsetof(vbo, last_frame) == 12 && offsetof(vbo, mapped) == 16 && offsetof(vbo, access) == 20 && offsetof(vbo, usage) == 24, "Pinned private VBO ABI");
+
+MLFreshStore vglFreshUploadRead(void) {
+	vbo *b = (vbo *)vertex_array_unit;
+	MLFreshStore r = {0};
+	r.error = vgl_error;
+	if (b) {
+		r.binding = (uint32_t)b;
+		r.storage = (uint32_t)b->ptr;
+		r.size = b->size;
+		r.allocator = (uint32_t)b->alloc_func;
+		r.last_frame = b->last_frame;
+		r.mapped = b->mapped;
+		r.access = b->access;
+		r.usage = b->usage;
+	}
+	return r;
+}
+
+int vglFreshUploadSourceCompatible(const void *data, uint32_t size, uint32_t storage) {
+	if (vgl_mem_get_type_by_addr((void *)storage) != VGL_MEM_VRAM)
+		return 0;
+	return vgl_mem_get_type_by_addr((void *)data) == (vglMemType)-1 && vgl_mem_get_type_by_addr((uint8_t *)data + size - 1) == (vglMemType)-1;
+}
+#endif
+
 inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLenum usage) {
 	THREAD_SAFE()
 
@@ -409,6 +448,14 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 #endif
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 	GLboolean was_scratch = gpu_buf->scratch;
+#endif
+#ifdef HAVE_BIOSHOCK_RENDERER
+	// Asked before anything of the buffer changes: the grant is for this exact state
+	GLboolean ml_reuse = GL_FALSE;
+	if (g_bioshock_fresh_upload_variant && data && size > 0) {
+		MLFreshStore actual = {(uint32_t)gpu_buf, (uint32_t)gpu_buf->ptr, (uint32_t)gpu_buf->size, (uint32_t)gpu_buf->alloc_func, gpu_buf->last_frame, gpu_buf->mapped, gpu_buf->access, gpu_buf->usage, vgl_error};
+		ml_reuse = ml_fresh_upload_take(&actual, (uint32_t)size, data, usage);
+	}
 #endif
 	switch (usage) {
 	case GL_STREAM_DRAW:
@@ -436,6 +483,11 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 	}
 
 	// Marking previous content for deletion or deleting it straight if unused
+#ifdef HAVE_BIOSHOCK_RENDERER
+	if (ml_reuse) {
+		// The granted store stays in place
+	} else
+#endif
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 	if (gpu_buf->ptr && !was_scratch) {
 #else
@@ -459,6 +511,11 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 		return;
 	}
 	// Allocating a new buffer
+#ifdef HAVE_BIOSHOCK_RENDERER
+	if (ml_reuse) {
+		// gpu_buf->ptr is the granted store
+	} else
+#endif
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 	if (gpu_buf->scratch)
 		gpu_buf->ptr = vgl_reserve_data_pool(size);
