@@ -4065,7 +4065,14 @@ void glGetActiveAttrib(GLuint prog, GLuint index, GLsizei bufSize, GLsizei *leng
 static GLsizei copy_active_uniform_name(GLchar *name, GLsizei bufSize, const char *pname, GLint array_size) {
 	if (!name || bufSize <= 0 || !pname)
 		return 0;
+#ifdef HAVE_UNIFORM_ARRAY_NAMES
+	// GL reports an active uniform array as "name[0]". Clients written against the plain
+	// name this library has always returned take other paths when they see the suffix.
 	const char *suffix = array_size > 1 && !strchr(pname, '[') ? "[0]" : "";
+#else
+	const char *suffix = "";
+	(void)array_size;
+#endif
 	size_t capacity = (size_t)bufSize - 1;
 	size_t name_length = strlen(pname);
 	size_t copied = name_length < capacity ? name_length : capacity;
