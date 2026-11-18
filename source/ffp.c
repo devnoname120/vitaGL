@@ -1956,9 +1956,35 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
 		}
 	}
 
+	// First vertex the client streams copy (FFP_INDEX_RANGE: the lowest index drawn)
+	uint32_t bottom_idx = 0;
 #ifndef DRAW_SPEEDHACK
 	// Detecting highest index value
 	if (!is_full_vbo && !top_idx) {
+#ifdef FFP_INDEX_RANGE
+		uint32_t low_idx = 0xFFFFFFFF;
+		if ((index_type & 1) == 0)
+		{
+			for (int i = 0; i < count; i++) {
+				const uint32_t v = idx_buf[i];
+				if (v > top_idx)
+					top_idx = v;
+				if (v < low_idx)
+					low_idx = v;
+			}
+		} else {
+			uint32_t *_idx_buf = (uint32_t *)idx_buf;
+			for (int i = 0; i < count; i++) {
+				const uint32_t v = _idx_buf[i];
+				if (v > top_idx)
+					top_idx = v;
+				if (v < low_idx)
+					low_idx = v;
+			}
+		}
+		if (count > 0)
+			bottom_idx = low_idx + base_idx;
+#else
 		if ((index_type & 1) == 0)
 		{
 			for (int i = 0; i < count; i++) {
@@ -1972,6 +1998,7 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
 					top_idx = _idx_buf[i];
 			}
 		}
+#endif
 		top_idx += base_idx + 1;
 	}
 #endif
@@ -2043,9 +2070,11 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
 						}
 #else
 						if (attr_idx != FFP_ATTRIB_NORMAL) {
-							ptr = ffp_client_color_shared(&color_client_stream, 0, top_idx);
+							// The shared copy starts at bottom_idx; the stream addresses vertex 0.
+							ptr = (uint8_t *)ffp_client_color_shared(&color_client_stream, bottom_idx, top_idx - bottom_idx) - bottom_idx * ffp_vertex_stream_config[FFP_ATTRIB_COLOR].stride;
 						} else {
-							uint32_t size = top_idx * ffp_vertex_stream_config[FFP_ATTRIB_NORMAL].stride;
+							const uint32_t stride = ffp_vertex_stream_config[FFP_ATTRIB_NORMAL].stride;
+							uint32_t size = (top_idx - bottom_idx) * stride;
 #ifdef SAFER_DRAW_SPEEDHACK
 							if (size > SAFE_DRAW_SIZE_THRESHOLD) {
 								ptr = (void *)ffp_vertex_attrib_offsets[FFP_ATTRIB_NORMAL];
@@ -2053,7 +2082,8 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
 #endif
 							{
 								ptr = gpu_alloc_mapped_temp(size);
-								vgl_fast_memcpy(ptr, (void *)ffp_vertex_attrib_offsets[FFP_ATTRIB_NORMAL], size);
+								vgl_fast_memcpy(ptr, (uint8_t *)ffp_vertex_attrib_offsets[FFP_ATTRIB_NORMAL] + bottom_idx * stride, size);
+								ptr = (uint8_t *)ptr - bottom_idx * stride;
 							}
 						}
 #endif
@@ -2063,7 +2093,8 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
 #ifdef DRAW_SPEEDHACK
 				ptr = (void *)ffp_vertex_attrib_offsets[attr_idx];
 #else
-				uint32_t size = top_idx * ffp_vertex_stream_config[attr_idx].stride;
+				const uint32_t stride = ffp_vertex_stream_config[attr_idx].stride;
+				uint32_t size = (top_idx - bottom_idx) * stride;
 #ifdef SAFER_DRAW_SPEEDHACK
 				if (size > SAFE_DRAW_SIZE_THRESHOLD) {
 					ptr = (void *)ffp_vertex_attrib_offsets[attr_idx];
@@ -2071,7 +2102,8 @@ void _glDrawElements_FixedFunctionIMPL(uint16_t *idx_buf, GLsizei count, uint32_
 #endif
 				{
 					ptr = gpu_alloc_mapped_temp(size);
-					vgl_fast_memcpy(ptr, (void *)ffp_vertex_attrib_offsets[attr_idx], size);
+					vgl_fast_memcpy(ptr, (uint8_t *)ffp_vertex_attrib_offsets[attr_idx] + bottom_idx * stride, size);
+					ptr = (uint8_t *)ptr - bottom_idx * stride;
 				}
 #endif
 			}
