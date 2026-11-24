@@ -65,7 +65,7 @@ GLboolean prim_is_non_native = GL_FALSE; // Flag for when a primitive not suppor
 			break; \
 		default: \
 			ptr = gpu_alloc_mapped_temp(count * sizeof(type_t)); \
-			vgl_fast_memcpy(ptr, src, count * sizeof(type_t)); \
+			vgl_draw_copy(ptr, src, count * sizeof(type_t)); \
 			break; \
 		} \
 	}

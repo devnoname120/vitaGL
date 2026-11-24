@@ -53,6 +53,11 @@ ifeq ($(FFP_INDEX_RANGE),1)
 CFLAGS += -DFFP_INDEX_RANGE
 endif
 
+# Draw-time copies of client vertex and index data go through vglSetDrawCopyHook.
+ifeq ($(HAVE_DRAW_COPY_HOOK),1)
+CFLAGS += -DHAVE_DRAW_COPY_HOOK
+endif
+
 # Shader glDrawElements copies client vertex streams from the lowest drawn
 # index instead of from vertex 0.
 ifeq ($(SHADER_INDEX_RANGE),1)

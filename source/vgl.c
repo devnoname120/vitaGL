@@ -197,6 +197,13 @@ uint8_t *vgl_reserve_data_pool(uint32_t size) {
  * ------------------------------
  */
 
+#ifdef HAVE_DRAW_COPY_HOOK
+void (*vgl_draw_copy_hook)(void *dst, const void *src, unsigned size);
+void vglSetDrawCopyHook(void (*hook)(void *dst, const void *src, unsigned size)) {
+	vgl_draw_copy_hook = hook;
+}
+#endif
+
 void vglUseVramForUSSE(GLboolean usage) {
 	use_vram_for_usse = usage;
 }

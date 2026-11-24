@@ -89,7 +89,7 @@ char vgl_file_cache_path[256];
 				ptrs[i] = (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
 			} else { \
 				ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
-				vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+				vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
 				attributes[i].offset = 0; \
 			} \
 		} \
@@ -106,7 +106,7 @@ char vgl_file_cache_path[256];
 			attributes[i].offset = 0; \
 		} else { \
 			ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
-			vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+			vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
 			attributes[i].offset = 0; \
 		} \
 	} else { \
@@ -489,7 +489,7 @@ static inline __attribute__((always_inline)) void vertex_layout_setup_ptrs(progr
 #endif
 			{
 				ptrs[0] = gpu_alloc_mapped_temp(size);
-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[first_attr_idx] + first * stride, size);
+				vgl_draw_copy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[first_attr_idx] + first * stride, size);
 			}
 		}
 	} else {
@@ -510,7 +510,7 @@ static inline __attribute__((always_inline)) void vertex_layout_setup_ptrs(progr
 #endif
 					{
 						ptrs[i] = gpu_alloc_mapped_temp(size);
-						vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * stride, size);
+						vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * stride, size);
 					}
 				}
 			}
@@ -755,7 +755,7 @@ static GLboolean gather_interleaved_client_attribs(program *p, SceGxmVertexAttri
 			return GL_FALSE;
 	}
 	ptrs[0] = gpu_alloc_mapped_temp(count * stride);
-	vgl_fast_memcpy(ptrs[0], (void *)base + first * stride, count * stride);
+	vgl_draw_copy(ptrs[0], (void *)base + first * stride, count * stride);
 	ptrs[0] = (uint8_t *)ptrs[0] - rebase * stride;
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
@@ -808,7 +808,7 @@ static void handle_unpacked_attribs_grouped(program *p, SceGxmVertexAttribute *a
 			continue;
 		}
 		uint8_t *copy = gpu_alloc_mapped_temp(count * stride);
-		vgl_fast_memcpy(copy, (void *)base + first * stride, count * stride);
+		vgl_draw_copy(copy, (void *)base + first * stride, count * stride);
 		copy -= rebase * stride;
 		for (int j = i; j < p->attr_num; j++) {
 			if (!(members & (1 << j)))
@@ -1295,7 +1295,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 	// Gathering real attribute data pointers
 	if (is_packed[0]) {
 		ptrs[0] = gpu_alloc_mapped_temp(highest * streams[0].stride);
-		vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride, highest * streams[0].stride);
+		vgl_draw_copy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride, highest * streams[0].stride);
 	}
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
@@ -1319,7 +1319,7 @@ void _glMultiDrawArrays_CustomShadersIMPL(SceGxmPrimitiveType gxm_p, uint16_t *i
 			}
 		} else {
 			ptrs[0] = gpu_alloc_mapped_temp((highest - lowest) * streams[0].stride);
-			vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride, (highest - lowest) * streams[0].stride);		
+			vgl_draw_copy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + lowest * streams[0].stride, (highest - lowest) * streams[0].stride);		
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
 				attributes[i].regIndex = p->attr[attr_idx].regIndex;
@@ -1560,7 +1560,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 #endif
 		{
 			ptrs[0] = gpu_alloc_mapped_temp(count * streams[0].stride);
-			vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride, count * streams[0].stride);
+			vgl_draw_copy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride, count * streams[0].stride);
 		}
 	}
 	for (int i = 0; i < p->attr_num; i++) {
@@ -1591,7 +1591,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 #endif
 			{
 				ptrs[0] = gpu_alloc_mapped_temp(count * streams[0].stride);
-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride, count * streams[0].stride);
+				vgl_draw_copy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride, count * streams[0].stride);
 			}
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1931,7 +1931,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 #endif
 		{
 			ptrs[0] = gpu_alloc_mapped_temp(top_idx * streams[0].stride);
-			vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
+			vgl_draw_copy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
 		}
 	}
 	for (int i = 0; i < p->attr_num; i++) {
@@ -1963,7 +1963,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 			{
 				const uint32_t stride = streams[0].stride;
 				ptrs[0] = gpu_alloc_mapped_temp((top_idx - bottom_idx) * stride);
-				vgl_fast_memcpy(ptrs[0], (uint8_t *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + bottom_idx * stride, (top_idx - bottom_idx) * stride);
+				vgl_draw_copy(ptrs[0], (uint8_t *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + bottom_idx * stride, (top_idx - bottom_idx) * stride);
 				ptrs[0] = (uint8_t *)ptrs[0] - bottom_idx * stride;
 			}
 			for (int i = 0; i < p->attr_num; i++) {

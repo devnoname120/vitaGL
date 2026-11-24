@@ -35,6 +35,22 @@
 #define vgl_fast_memcpy sceClibMemcpy
 #endif
 
+/* HAVE_DRAW_COPY_HOOK: the copies of client vertex and index data a draw makes
+ * go through vglSetDrawCopyHook's function when one is set (an application
+ * may spread large copies over worker threads). */
+#ifdef HAVE_DRAW_COPY_HOOK
+extern void (*vgl_draw_copy_hook)(void *dst, const void *src, unsigned size);
+#define vgl_draw_copy(dst, src, size) \
+	do { \
+		if (vgl_draw_copy_hook) \
+			vgl_draw_copy_hook((dst), (src), (size)); \
+		else \
+			vgl_fast_memcpy((dst), (src), (size)); \
+	} while (0)
+#else
+#define vgl_draw_copy vgl_fast_memcpy
+#endif
+
 extern vglMemType VGL_MEM_MAIN; // Flag for VRAM usage for allocations
 
 // Support for older vitasdk versions for CI based on ancient builds

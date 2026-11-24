@@ -1343,6 +1343,8 @@ void vglUseTripleBuffering(GLboolean usage);
 
 // Allows to set a preference on the kind of memory to use for the internal USSE buffers in sceGxm. By default vitaGL will not use VRAM memory.
 void vglUseVramForUSSE(GLboolean usage);
+// HAVE_DRAW_COPY_HOOK builds: the function that copies a draw's client vertex and index data (NULL: the default copy)
+void vglSetDrawCopyHook(void (*hook)(void *dst, const void *src, unsigned size));
 
 // Allows vitaGL to use newlib memory once all internal mempools are exhausted. Default value: GL_TRUE.
 void vglUseExtraMem(GLboolean usage);
