@@ -53,6 +53,12 @@ ifeq ($(FFP_INDEX_RANGE),1)
 CFLAGS += -DFFP_INDEX_RANGE
 endif
 
+# Shader glDrawElements copies client vertex streams from the lowest drawn
+# index instead of from vertex 0.
+ifeq ($(SHADER_INDEX_RANGE),1)
+CFLAGS += -DSHADER_INDEX_RANGE
+endif
+
 ifeq ($(HAVE_UNIFORM_ARRAY_NAMES),1)
 CFLAGS += -DHAVE_UNIFORM_ARRAY_NAMES
 endif

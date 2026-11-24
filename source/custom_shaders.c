@@ -729,7 +729,7 @@ static inline __attribute__((always_inline)) uint32_t gxm_vd_fmt_size(SceGxmAttr
  * memory with one stride and lies inside one vertex record, copy the records
  * once from the lowest attribute and address each attribute by its offset.
  */
-static GLboolean gather_interleaved_client_attribs(program *p, SceGxmVertexAttribute *attributes, SceGxmVertexStream *streams, void **ptrs, uint32_t first, uint32_t count) {
+static GLboolean gather_interleaved_client_attribs(program *p, SceGxmVertexAttribute *attributes, SceGxmVertexStream *streams, void **ptrs, uint32_t first, uint32_t count, uint32_t rebase) {
 	uint32_t base = 0xFFFFFFFF, stride = 0, active = 0;
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
@@ -756,6 +756,7 @@ static GLboolean gather_interleaved_client_attribs(program *p, SceGxmVertexAttri
 	}
 	ptrs[0] = gpu_alloc_mapped_temp(count * stride);
 	vgl_fast_memcpy(ptrs[0], (void *)base + first * stride, count * stride);
+	ptrs[0] = (uint8_t *)ptrs[0] - rebase * stride;
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
 		attributes[i].regIndex = p->attr[attr_idx].regIndex;
@@ -772,7 +773,7 @@ static GLboolean gather_interleaved_client_attribs(program *p, SceGxmVertexAttri
  * Attributes read from one client array (same stride, inside one record of a
  * common base) share one copy here and read it at their own offsets; every
  * other attribute is handled as before. */
-static void handle_unpacked_attribs_grouped(program *p, SceGxmVertexAttribute *attributes, SceGxmVertexStream *streams, void **ptrs, uint32_t first, uint32_t count) {
+static void handle_unpacked_attribs_grouped(program *p, SceGxmVertexAttribute *attributes, SceGxmVertexStream *streams, void **ptrs, uint32_t first, uint32_t count, uint32_t rebase) {
 	uint32_t grouped = 0;
 	for (int i = 0; i < p->attr_num; i++) {
 		uint8_t attr_idx = p->attr_map[i];
@@ -802,10 +803,13 @@ static void handle_unpacked_attribs_grouped(program *p, SceGxmVertexAttribute *a
 		}
 		if (!(members & (members - 1))) {
 			handle_unpacked_attrib(first, count);
+			if (rebase && (cur_vao->vertex_attrib_state & (1 << attr_idx)))
+				ptrs[i] = (uint8_t *)ptrs[i] - rebase * streams[i].stride;
 			continue;
 		}
 		uint8_t *copy = gpu_alloc_mapped_temp(count * stride);
 		vgl_fast_memcpy(copy, (void *)base + first * stride, count * stride);
+		copy -= rebase * stride;
 		for (int j = i; j < p->attr_num; j++) {
 			if (!(members & (1 << j)))
 				continue;
@@ -1596,12 +1600,12 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 			}
 		}
 #ifdef HAVE_CLIENT_ARRAY_GROUPS
-	} else if (gather_interleaved_client_attribs(p, attributes, streams, ptrs, first, count)) {
+	} else if (gather_interleaved_client_attribs(p, attributes, streams, ptrs, first, count, 0)) {
 		is_packed = GL_TRUE;
 #endif
 	} else {
 #ifdef HAVE_CLIENT_ARRAY_GROUPS
-		handle_unpacked_attribs_grouped(p, attributes, streams, ptrs, first, count);
+		handle_unpacked_attribs_grouped(p, attributes, streams, ptrs, first, count, 0);
 #else
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
@@ -1866,8 +1870,36 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 		is_full_vbo = GL_FALSE;
 #endif
 
+	/* First vertex the client streams copy. SHADER_INDEX_RANGE: the lowest
+	 * index drawn; the copy starts there and its stream address moves back by
+	 * as many vertices, so the GPU reads the same data. */
+	uint32_t bottom_idx = 0;
 	// Detecting highest index value
 	if (!is_full_vbo && !top_idx) {
+#ifdef SHADER_INDEX_RANGE
+		uint32_t low_idx = 0xFFFFFFFF;
+		if ((index_type & 1) == 0) {
+			for (int i = 0; i < count; i++) {
+				const uint32_t v = idx_buf[i];
+				if (v > top_idx)
+					top_idx = v;
+				if (v < low_idx)
+					low_idx = v;
+			}
+		} else {
+			uint32_t *_idx_buf = (uint32_t *)idx_buf;
+			for (int i = 0; i < count; i++) {
+				const uint32_t v = _idx_buf[i];
+				if (v > top_idx)
+					top_idx = v;
+				if (v < low_idx)
+					low_idx = v;
+			}
+		}
+		/* Instanced streams are read by instance, not by vertex index. */
+		if (count > 0 && !(index_type & 2))
+			bottom_idx = low_idx + base_idx;
+#else
 		if ((index_type & 1) == 0)
 		{
 			for (int i = 0; i < count; i++) {
@@ -1885,6 +1917,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				}
 			}
 		}
+#endif
 		top_idx += base_idx + 1;
 	}
 
@@ -1928,8 +1961,10 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 			} else
 #endif
 			{
-				ptrs[0] = gpu_alloc_mapped_temp(top_idx * streams[0].stride);
-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
+				const uint32_t stride = streams[0].stride;
+				ptrs[0] = gpu_alloc_mapped_temp((top_idx - bottom_idx) * stride);
+				vgl_fast_memcpy(ptrs[0], (uint8_t *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + bottom_idx * stride, (top_idx - bottom_idx) * stride);
+				ptrs[0] = (uint8_t *)ptrs[0] - bottom_idx * stride;
 			}
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
@@ -1938,17 +1973,19 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 			}
 		}	
 #ifdef HAVE_CLIENT_ARRAY_GROUPS
-	} else if (gather_interleaved_client_attribs(p, attributes, streams, ptrs, 0, top_idx)) {
+	} else if (gather_interleaved_client_attribs(p, attributes, streams, ptrs, bottom_idx, top_idx - bottom_idx, bottom_idx)) {
 		is_packed = GL_TRUE;
 #endif
 	} else {
 #ifdef HAVE_CLIENT_ARRAY_GROUPS
-		handle_unpacked_attribs_grouped(p, attributes, streams, ptrs, 0, top_idx);
+		handle_unpacked_attribs_grouped(p, attributes, streams, ptrs, bottom_idx, top_idx - bottom_idx, bottom_idx);
 #else
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
 			attributes[i].regIndex = p->attr[attr_idx].regIndex;
-			handle_unpacked_attrib(0, top_idx);
+			handle_unpacked_attrib(bottom_idx, top_idx - bottom_idx);
+			if (bottom_idx && (cur_vao->vertex_attrib_state & (1 << attr_idx)))
+				ptrs[i] = (uint8_t *)ptrs[i] - bottom_idx * streams[i].stride;
 		}
 #endif
 	}
