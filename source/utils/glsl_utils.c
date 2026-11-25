@@ -25,6 +25,7 @@
 #include <string.h>
 #include "../shared.h"
 #include "glsl_utils.h"
+#include "glsl_swizzle.h"
 #include "preprocessor/preprocessor_c.h"
 
 #define GLSL_BUFFER_MIN_CAPACITY (4096)
@@ -1377,6 +1378,7 @@ void glsl_translator_process(shader *s) {
 #ifdef DEBUG_GLSL_PREPROCESSOR
 	vgl_log("%s:%d %s: GLSL preprocessor output:\n\n%s\n\n", __FILE__, __LINE__, __func__, out);
 #endif
+	glsl_translate_st_swizzles(out);
 	size += strlen(out);
 	
 	// Nukeing precision directives
