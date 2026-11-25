@@ -81,15 +81,15 @@ char vgl_file_cache_path[256];
 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
 		if (cur_vao->vertex_attrib_vbo[attr_idx]) { \
 			vbo *gpu_buf = (vbo *)cur_vao->vertex_attrib_vbo[attr_idx]; \
-			ptrs[i] = (uint8_t *)gpu_buf->ptr + cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
+			ptrs[i] = (uint8_t *)gpu_buf->ptr + cur_vao->vertex_attrib_offsets[attr_idx] + (first) * streams[i].stride; \
 			gpu_buf->last_frame = vgl_framecount; \
 			attributes[i].offset = 0; \
 		} else { \
-			if (count * streams[i].stride > SAFE_DRAW_SIZE_THRESHOLD) { \
-				ptrs[i] = (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
+			if ((count) * streams[i].stride > SAFE_DRAW_SIZE_THRESHOLD) { \
+				ptrs[i] = (void *)cur_vao->vertex_attrib_offsets[attr_idx] + (first) * streams[i].stride; \
 			} else { \
-				ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
-				vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+				ptrs[i] = gpu_alloc_mapped_temp((count) * streams[i].stride); \
+				vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + (first) * streams[i].stride, (count) * streams[i].stride); \
 				attributes[i].offset = 0; \
 			} \
 		} \
@@ -101,12 +101,12 @@ char vgl_file_cache_path[256];
 	if (cur_vao->vertex_attrib_state & (1 << attr_idx)) { \
 		if (cur_vao->vertex_attrib_vbo[attr_idx]) { \
 			vbo *gpu_buf = (vbo *)cur_vao->vertex_attrib_vbo[attr_idx]; \
-			ptrs[i] = (uint8_t *)gpu_buf->ptr + cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
+			ptrs[i] = (uint8_t *)gpu_buf->ptr + cur_vao->vertex_attrib_offsets[attr_idx] + (first) * streams[i].stride; \
 			gpu_buf->last_frame = vgl_framecount; \
 			attributes[i].offset = 0; \
 		} else { \
-			ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
-			vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride, count * streams[i].stride); \
+			ptrs[i] = gpu_alloc_mapped_temp((count) * streams[i].stride); \
+			vgl_draw_copy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + (first) * streams[i].stride, (count) * streams[i].stride); \
 			attributes[i].offset = 0; \
 		} \
 	} else { \
