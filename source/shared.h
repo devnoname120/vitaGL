@@ -687,6 +687,15 @@ typedef struct {
 	GLenum access, usage;
 } vbo;
 
+#ifdef HAVE_INDEX_REORDER
+// index_opt.c: reordered copy of a static triangle-list index range (or src)
+const uint16_t *vgl_index_opt_lookup(const vbo *buf, uint32_t offset, int32_t count, const uint16_t *src);
+void vgl_index_opt_invalidate(const vbo *buf);
+#define index_opt_invalidate(b) vgl_index_opt_invalidate(b)
+#else
+#define index_opt_invalidate(b)
+#endif
+
 // VAO struct
 typedef struct {
 	uint32_t index_array_unit;

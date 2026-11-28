@@ -366,6 +366,10 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
 		convert_16_to_8bit_indices(idx16, (const uint8_t *)src, count);
 		src = idx16;
 	}
+#ifdef HAVE_INDEX_REORDER
+	else if (gpu_buf && mode == GL_TRIANGLES && type == GL_UNSIGNED_SHORT)
+		src = (uint16_t *)vgl_index_opt_lookup(gpu_buf, (uint32_t)gl_indices, count, src);
+#endif
 	
 	if (cur_program != 0)
 		is_draw_legal = _glDrawElements_CustomShadersIMPL(src, count, 0, 0, type != GL_UNSIGNED_INT ? SCE_GXM_INDEX_SOURCE_INDEX_16BIT : SCE_GXM_INDEX_SOURCE_INDEX_32BIT);

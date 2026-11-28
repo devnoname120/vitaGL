@@ -369,6 +369,7 @@ void glDeleteBuffers(GLsizei n, const GLuint *gl_buffers) {
 	for (int j = 0; j < n; j++) {
 		if (gl_buffers[j]) {
 			vbo *gpu_buf = (vbo *)gl_buffers[j];
+			index_opt_invalidate(gpu_buf);
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 			if (gpu_buf->ptr && !gpu_buf->scratch) {
 #else
@@ -438,6 +439,8 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 	THREAD_SAFE()
 
 	vbo *gpu_buf = (vbo *)buffer;
+	if (gpu_buf)
+		index_opt_invalidate(gpu_buf);
 	
 #ifndef SKIP_ERROR_HANDLING
 	if (size < 0) {
@@ -561,6 +564,8 @@ inline void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size
 	THREAD_SAFE()
 
 	vbo *gpu_buf = (vbo *)buffer;
+	if (gpu_buf)
+		index_opt_invalidate(gpu_buf);
 
 #ifndef SKIP_ERROR_HANDLING
 	if (!gpu_buf) {
@@ -636,6 +641,8 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 
 inline void *glMapNamedBuffer(GLuint buffer, GLenum access) {
 	vbo *gpu_buf = (vbo *)buffer;
+	if (gpu_buf)
+		index_opt_invalidate(gpu_buf);
 	
 #ifndef SKIP_ERROR_HANDLING
 	switch (access) {
@@ -696,6 +703,8 @@ void *glMapBuffer(GLenum target, GLenum access) {
 
 inline void *glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) {
 	vbo *gpu_buf = (vbo *)buffer;
+	if (gpu_buf)
+		index_opt_invalidate(gpu_buf);
 
 #ifndef SKIP_ERROR_HANDLING
 	if (!gpu_buf) {
@@ -731,6 +740,8 @@ void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
 
 inline GLboolean glUnmapNamedBuffer(GLuint buffer) {
 	vbo *gpu_buf = (vbo *)buffer;
+	if (gpu_buf)
+		index_opt_invalidate(gpu_buf);
 
 #ifndef SKIP_ERROR_HANDLING
 	if (!gpu_buf || !gpu_buf->mapped) {

@@ -4612,3 +4612,28 @@ void vglShaderGxpBinary(GLsizei count, const GLuint *handles, const void *binary
 	sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, s->prog, &s->id);
 	s->unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(s->prog);
 }
+
+#ifdef HAVE_INDEX_REORDER
+// index_opt.c diag: the current program and a hash of its vertex default uniform buffer
+uint32_t vgl_index_opt_program_info(uint32_t *vhash, uint32_t *fhash) {
+	*vhash = *fhash = 0;
+	if (!cur_program)
+		return 0;
+	program *p = &progs[cur_program - 1];
+	uint32_t h = 2166136261u;
+	if (p->unif_vbuffer && p->vshader) {
+		const uint8_t *b = (const uint8_t *)p->unif_vbuffer;
+		for (uint32_t i = 0; i < p->vshader->unif_buf_size; i++)
+			h = (h ^ b[i]) * 16777619u;
+	}
+	*vhash = h;
+	h = 2166136261u;
+	if (p->unif_fbuffer && p->fshader) {
+		const uint8_t *b = (const uint8_t *)p->unif_fbuffer;
+		for (uint32_t i = 0; i < p->fshader->unif_buf_size; i++)
+			h = (h ^ b[i]) * 16777619u;
+	}
+	*fhash = h;
+	return cur_program;
+}
+#endif
