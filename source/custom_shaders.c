@@ -400,6 +400,11 @@ typedef struct {
 #if defined(HAVE_VERTEX_LAYOUT_CACHE) && !defined(STRICT_DRAW_COMPLIANCE) && !defined(DRAW_SPEEDHACK)
 	uint32_t vertex_layout_version;
 #endif
+#ifdef HAVE_CLUSTER_CULL
+	int8_t io_cull; // index_opt.c: 0 unknown, 1 plain object-to-clip transform, -1 not
+	uint8_t io_pos_attr;
+	uint16_t io_mvp_word;
+#endif
 #ifdef HAVE_BIOSHOCK_RENDERER
 	uint8_t validation; // Result of glValidateProgram (PROG_NOT_VALIDATED, PROG_VALIDATED, PROG_UBO_MISSING)
 	shader *public_vshader; // Attached shaders while vshader and fshader are a substituted pair (coordinate_pair_binary.inc)
@@ -3196,6 +3201,9 @@ void glLinkProgram(GLuint progr) {
 	{
 		// Checking if bound attributes are aligned
 		p->has_unaligned_attrs = GL_FALSE;
+#ifdef HAVE_CLUSTER_CULL
+		p->io_cull = 0;
+#endif
 
 		for (i = 0; i < p->attr_num; i++) {
 			p->attr_map[i] = i;
@@ -4635,5 +4643,77 @@ uint32_t vgl_index_opt_program_info(uint32_t *vhash, uint32_t *fhash) {
 	}
 	*fhash = h;
 	return cur_program;
+}
+#endif
+
+#ifdef HAVE_CLUSTER_CULL
+/* index_opt.c cluster culling: where the current draw's object-space positions are and
+ * the matrix that takes them to clip space. Only for vertex programs whose uniforms
+ * are all on this list (none moves a vertex; LocalToProjection required, so
+ * gl_Position = LocalToProjection * Position) and that sample no texture, with
+ * Position read from a VBO as 3 or 4 floats. */
+static const char *const io_plain_uniforms[] = {"LocalToProjection", "AmbientColorLow", "AmbientColorHigh", "LocalToWorldRotation",
+	"LightmapLightColors", "CameraWorldPosition", "SpotLightMask", "TextureTransform", "TextureTransform2", "DynamicLightVectors",
+	"DynamicLightInvRadiuses", "UniformMultiplyColor", "LightmapCoordinateScaleBias", "CanvasColor"};
+
+int vgl_index_opt_transform(vgl_io_transform *t) {
+	if (!cur_program)
+		return 0;
+	program *p = &progs[cur_program - 1];
+	if (!p->vshader || !p->vshader->prog || !p->unif_vbuffer)
+		return 0;
+	if (p->io_cull == 0) {
+		p->io_cull = -1;
+		const SceGxmProgram *vp = p->vshader->prog;
+		int mvp = -1, ok = 1;
+		const uint32_t n = sceGxmProgramGetParameterCount(vp);
+		for (uint32_t i = 0; i < n && ok; i++) {
+			const SceGxmProgramParameter *q = sceGxmProgramGetParameter(vp, i);
+			const SceGxmParameterCategory cat = sceGxmProgramParameterGetCategory(q);
+			if (cat == SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE)
+				continue;
+			if (cat != SCE_GXM_PARAMETER_CATEGORY_UNIFORM || sceGxmProgramParameterGetContainerIndex(q) != UBOS_NUM) {
+				ok = 0;
+				break;
+			}
+			const char *name = sceGxmProgramParameterGetName(q);
+			int known = 0;
+			for (uint32_t k = 0; k < sizeof(io_plain_uniforms) / sizeof(io_plain_uniforms[0]); k++)
+				known |= !strcmp(name, io_plain_uniforms[k]);
+			if (!known)
+				ok = 0;
+			else if (!strcmp(name, "LocalToProjection")) {
+				if (sceGxmProgramParameterGetType(q) != SCE_GXM_PARAMETER_TYPE_F32 || sceGxmProgramParameterGetComponentCount(q) != 4 ||
+				    sceGxmProgramParameterGetArraySize(q) != 4)
+					ok = 0;
+				else
+					mvp = (int)sceGxmProgramParameterGetResourceIndex(q);
+			}
+		}
+		const GLint loc = ok && mvp >= 0 ? glGetAttribLocation(cur_program, "Position") : -1;
+		if (loc >= 0 && loc < VERTEX_ATTRIBS_NUM && mvp < 0xffff) {
+			p->io_cull = 1;
+			p->io_pos_attr = (uint8_t)loc;
+			p->io_mvp_word = (uint16_t)mvp;
+		}
+	}
+	if (p->io_cull != 1)
+		return 0;
+	const uint8_t a = p->io_pos_attr;
+	if (!(cur_vao->vertex_attrib_state & (1 << a)) || !cur_vao->vertex_attrib_vbo[a])
+		return 0;
+	const SceGxmVertexAttribute *c = &cur_vao->vertex_attrib_config[a];
+	if (c->format != SCE_GXM_ATTRIBUTE_FORMAT_F32 || c->componentCount < 3)
+		return 0;
+	vbo *b = (vbo *)cur_vao->vertex_attrib_vbo[a];
+	if (!b->ptr)
+		return 0;
+	t->vbo = b;
+	t->store = b->ptr;
+	t->offset = cur_vao->vertex_attrib_offsets[a];
+	t->stride = cur_vao->vertex_stream_config[a].stride;
+	t->components = c->componentCount;
+	t->mvp = (const float *)p->unif_vbuffer + p->io_mvp_word;
+	return 1;
 }
 #endif

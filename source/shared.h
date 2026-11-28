@@ -687,6 +687,19 @@ typedef struct {
 	GLenum access, usage;
 } vbo;
 
+#ifdef HAVE_CLUSTER_CULL
+// custom_shaders.c -> index_opt.c: object-space position source and object-to-clip matrix
+typedef struct {
+	const vbo *vbo;
+	const void *store;
+	uint32_t offset, stride, components;
+	const float *mvp; // column-major 4x4
+} vgl_io_transform;
+int vgl_index_opt_transform(vgl_io_transform *t);
+// glDrawElements: index runs of the last vgl_index_opt_lookup that survived culling (count -1: draw it whole)
+extern int32_t vgl_index_opt_runs;
+extern uint32_t vgl_index_opt_run[][2];
+#endif
 #ifdef HAVE_INDEX_REORDER
 // index_opt.c: reordered copy of a static triangle-list index range (or src)
 const uint16_t *vgl_index_opt_lookup(const vbo *buf, uint32_t offset, int32_t count, const uint16_t *src);

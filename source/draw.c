@@ -366,8 +366,11 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
 		convert_16_to_8bit_indices(idx16, (const uint8_t *)src, count);
 		src = idx16;
 	}
+#ifdef HAVE_CLUSTER_CULL
+	vgl_index_opt_runs = -1;
+#endif
 #ifdef HAVE_INDEX_REORDER
-	else if (gpu_buf && mode == GL_TRIANGLES && type == GL_UNSIGNED_SHORT)
+	if (gpu_buf && mode == GL_TRIANGLES && type == GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE)
 		src = (uint16_t *)vgl_index_opt_lookup(gpu_buf, (uint32_t)gl_indices, count, src);
 #endif
 	
@@ -385,6 +388,13 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
 	{
 		if (type == GL_UNSIGNED_SHORT) {
 			setup_elements_indices(uint16_t);
+#ifdef HAVE_CLUSTER_CULL
+			if (vgl_index_opt_runs >= 0) {
+				for (int32_t r = 0; r < vgl_index_opt_runs; r++)
+					sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, ptr + vgl_index_opt_run[r][0], vgl_index_opt_run[r][1]);
+				vgl_index_opt_runs = -1;
+			} else
+#endif
 			sceGxmDraw(gxm_context, gxm_p, SCE_GXM_INDEX_FORMAT_U16, ptr, count);
 		} else if (type == GL_UNSIGNED_INT) {
 			setup_elements_indices(uint32_t);
